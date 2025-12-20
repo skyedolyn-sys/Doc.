@@ -1,12 +1,9 @@
 import base64
-import concurrent.futures
 import json
 import os
 import re
-import time
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Tuple
 
 import streamlit as st
 import pdfplumber
@@ -829,84 +826,14 @@ def llm_enhance_markdown(text: str, format_requirements: str = "") -> str:
     return content
 
 
-def _process_single_chunk(
-    chunk_index: int,
-    chunk_text: str,
-    format_summary: str,
-    base_prompt_template: str,
-    total_chunks: int,
-    chunk_timeout: int = 18
-) -> Tuple[int, list[dict], Optional[str]]:
-    """处理单个分块的辅助函数（用于并行处理）。
-    
-    Args:
-        chunk_index: 分块索引
-        chunk_text: 分块文本
-        format_summary: 格式要求摘要
-        base_prompt_template: 基础prompt模板
-        total_chunks: 总分块数
-        chunk_timeout: 超时时间
-    
-    Returns:
-        (chunk_index, blocks_list, error_message) 元组
-    """
-    try:
-        # 构建prompt
-        context_info = ""
-        if chunk_index > 0:
-            context_info = f"\n**片段 {chunk_index + 1}/{total_chunks}**：如开头是正文，保持type=\"body\"。\n"
-        
-        prompt = base_prompt_template + context_info + f"【内容】:\n{chunk_text}"
-        
-        # 调用LLM
-        content = _call_zhipu_llm(
-            prompt=prompt,
-            model="glm-4-flash",
-            temperature=0.1,
-            timeout=chunk_timeout,
-            max_retries=1
-        )
-        
-        blocks = []
-        if content:
-            data = _extract_json_from_text(content, bracket_type="[")
-            if isinstance(data, list) and len(data) > 0:
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    block_type = str(item.get("type", "body"))
-                    if block_type not in {"title", "heading1", "heading2", "body"}:
-                        block_type = "body"
-                    text = str(item.get("text", "")).strip()
-                    if text:
-                        blocks.append({"type": block_type, "text": text})
-            else:
-                # 解析失败，作为body处理
-                if chunk_text.strip():
-                    blocks.append({"type": "body", "text": chunk_text.strip()})
-        else:
-            # LLM返回空，作为body处理
-            if chunk_text.strip():
-                blocks.append({"type": "body", "text": chunk_text.strip()})
-        
-        return (chunk_index, blocks, None)
-        
-    except Exception as e:
-        # 错误时返回body块
-        blocks = []
-        if chunk_text.strip():
-            blocks.append({"type": "body", "text": chunk_text.strip()})
-        return (chunk_index, blocks, str(e)[:100])
-
-
-def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: int = 12000, overlap: int = 200) -> list[dict]:
-    """使用分块策略处理长文档的标题识别（性能优化版）。
+def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: int = 6000, overlap: int = 500) -> list[dict]:
+    """使用分块策略处理长文档的标题识别。
     
     Args:
         format_requirements: 格式要求文本
         body: 正文内容（可能很长）
-        chunk_size: 每个分块的最大字符数（默认12000，优化后）
-        overlap: 分块之间的重叠字符数（默认200，优化后）
+        chunk_size: 每个分块的最大字符数（默认6000，留出prompt空间）
+        overlap: 分块之间的重叠字符数（默认500，避免在标题中间切分）
     
     Returns:
         合并后的 blocks 列表
@@ -918,160 +845,104 @@ def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: 
     total_length = len(body)
     position = 0
     
-    # 优化：简化格式要求提取，只保留关键信息
-    format_summary = ""
+    format_guidance = ""
     if format_requirements and format_requirements.strip():
-        # 只提取前800字符的关键格式信息（从2000减少到800）
-        format_summary = format_requirements[:800]
-        # 提取关键格式词（标题、字体、字号等）
-        key_patterns = [
-            r'标题[：:].*?[。\n]',
-            r'heading[：:].*?[。\n]',
-            r'字体[：:].*?[。\n]',
-            r'font[：:].*?[。\n]',
-            r'字号[：:].*?[。\n]',
-            r'size[：:].*?[。\n]',
-        ]
-        key_info = []
-        for pattern in key_patterns:
-            matches = re.findall(pattern, format_summary, re.IGNORECASE)
-            key_info.extend(matches[:2])  # 每种类型最多2条
-        if key_info:
-            format_summary = ' '.join(key_info[:5])  # 最多5条关键信息
+        format_guidance = (
+            "\n\n**格式要求参考**：\n"
+            "如果格式要求中提到了标题级别（如\"一级标题\"、\"二级标题\"、\"标题字号\"等），"
+            "请参考这些信息来准确识别标题层级。\n"
+        )
     
-    # 优化：大幅精简prompt，减少token消耗（从~500 tokens减少到~200 tokens）
+    # 基础 prompt 模板
     base_prompt_template = (
-        "划分文档结构，输出JSON数组。每个元素：{\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"}\n\n"
-        "**类型**：\n"
-        "- title: 主标题\n"
-        "- heading1: 一级标题（\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
-        "- heading2: 二级标题（\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
-        "- body: 正文\n\n"
-        "**规则**：识别纯文本标题（\"一、\"、\"（一）\"、\"1.1\"等），正确标记type，不改写内容。\n"
+        "你是一名文档排版助手，请根据【格式要求】和【正文内容片段】准确划分结构，输出 JSON 数组。\n"
+        "每个元素必须是形如 {\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"} 的对象：\n\n"
+        "**标题类型**：\n"
+        "- title: 文档主标题（通常只有一个）\n"
+        "- heading1: 一级标题（如\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
+        "- heading2: 二级标题（如\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
+        "- body: 正文段落\n\n"
+        "**识别与标记规则（必须严格遵守）**：\n"
+        "- **重要**：即使没有Markdown标记（`#`），也要识别纯文本格式的标题（\"一、\"、\"（一）\"、\"(一)\"、\"1.1\"等），并做相应标记，确保文档生成时根据格式要求进行处理；\n"
+        "- **编号识别与标记**：\n"
+        "  * heading1: \"一、\"、\"二、\"、\"第一章\"、\"1.\"等开头的独立行，**必须标记为heading1**\n"
+        "  * heading2: \"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等开头的独立行（无论中文括号还是英文括号），**必须标记为heading2**\n"
+        "- **关键规则**：\n"
+        "  * 以\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等编号开头的行，**必须标记为heading2，绝对不能标记为body**\n"
+        "  * 嵌套编号层级：\"一、\"→heading1，\"（一）\"/(一)→heading2\n"
+        "  * 不要把带编号的标题标记为body\n"
+        "- **识别验证与标记确认**：\n"
+        "  * 识别到标题后，必须立即标记为对应的type（title/heading1/heading2），不能遗漏或错误标记\n"
+        "  * 如果格式要求中指定了标题格式，参考格式要求来识别和标记标题层级\n"
+        "  * 只拆分和标注结构，不改写内容\n\n"
+        "**示例**：\n"
+        "- \"一、事件概况\" → {\"type\": \"heading1\", \"text\": \"一、事件概况\"}\n"
+        "- \"(一)目标定位\" → {\"type\": \"heading2\", \"text\": \"(一)目标定位\"}\n\n"
+        "**输出要求**：\n"
+        "- 仅输出 JSON 数组，不要添加多余文字或解释；\n"
+        "- 确保 JSON 格式正确，可以被解析；\n"
+        "- 每个识别到的标题都必须有正确的type标记，确保文档生成时能根据格式要求进行处理。\n"
+        f"{format_guidance}"
+        f"【格式要求】:\n{format_requirements[:2000]}\n\n"
     )
     
-    # 只在有格式要求时添加格式参考
-    if format_summary:
-        base_prompt_template += f"**格式参考**：{format_summary}\n\n"
-    
-    base_prompt_template += "**输出**：仅JSON数组，无其他文字。\n\n"
-    
     chunk_index = 0
-    total_chunks = max(1, (total_length + chunk_size - 1) // chunk_size)
+    total_chunks = (total_length + chunk_size - 1) // chunk_size  # 估算总块数
     
     # 创建进度条
+    import streamlit as st
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 优化：添加总时间限制
-    start_time = time.time()
-    max_total_time = 90  # 最多90秒总处理时间
-    chunk_timeout = 18  # 每个分块最多18秒（从30秒减少）
-    
-    # 优化：预编译正则表达式，提高切分速度
-    # 标题编号模式（用于智能切分）
-    heading_patterns = [
-        re.compile(r'^[一二三四五六七八九十]+[、.]'),  # 一、二、
-        re.compile(r'^第[一二三四五六七八九十]+[章节部分]'),  # 第一章
-        re.compile(r'^\d+[、.]'),  # 1. 2.
-        re.compile(r'^[（(][一二三四五六七八九十]+[）)]'),  # （一）
-        re.compile(r'^\d+\.\d+'),  # 1.1
-        re.compile(r'^\d+[）)]'),  # 1）
-    ]
-    
     while position < total_length:
-        # 优化：检查总处理时间
-        elapsed = time.time() - start_time
-        if elapsed > max_total_time:
-            st.warning(f"⏱️ 处理超时（{elapsed:.0f}秒），已处理 {chunk_index} 个片段，剩余内容将作为正文处理")
-            if position < total_length:
-                remaining_text = body[position:].strip()
-                if remaining_text:
-                    all_blocks.append({"type": "body", "text": remaining_text})
-            break
-        
-        # 优化：使用正则表达式快速找到最佳切分点
+        # 计算当前分块的结束位置
         end_position = min(position + chunk_size, total_length)
-        
-        if end_position < total_length:
-            # 获取重叠区域的文本
-            lookahead_text = body[end_position:min(end_position + overlap, total_length)]
-            
-            # 优化：使用正则表达式快速查找切分点（优先级：换行 > 句号 > 标题编号）
-            best_break = None
-            best_break_pos = None
-            
-            # 1. 优先查找换行符后的位置（最快、最安全）
-            newline_match = re.search(r'\n+', lookahead_text)
-            if newline_match:
-                best_break = newline_match.end()
-                best_break_pos = end_position + best_break
-            
-            # 2. 如果没有换行，查找句号后的位置
-            elif re.search(r'[。.]\s*', lookahead_text):
-                period_match = re.search(r'[。.]\s*', lookahead_text)
-                best_break = period_match.end()
-                best_break_pos = end_position + best_break
-            
-            # 3. 如果都没有，查找标题编号后的位置（避免在标题中间切分）
-            else:
-                for i in range(min(100, len(lookahead_text))):  # 只检查前100字符
-                    check_pos = end_position + i
-                    if check_pos >= total_length:
-                        break
-                    # 检查是否是标题编号
-                    line_start = check_pos
-                    # 向前找到行首
-                    while line_start > position and body[line_start - 1] != '\n':
-                        line_start -= 1
-                    line_text = body[line_start:check_pos + 10]  # 检查行首10字符
-                    for pattern in heading_patterns:
-                        if pattern.match(line_text):
-                            # 找到标题编号，在标题后切分
-                            # 查找标题后的换行或句号
-                            title_end = check_pos + 50  # 标题后50字符内
-                            for j in range(check_pos, min(title_end, total_length)):
-                                if body[j] in ['\n', '。', '.']:
-                                    best_break = j - end_position + 1
-                                    best_break_pos = j + 1
-                                    break
-                            if best_break:
-                                break
-                    if best_break:
-                        break
-            
-            # 应用找到的切分点
-            if best_break_pos and best_break_pos > end_position:
-                end_position = best_break_pos
-        
         chunk_text = body[position:end_position]
         
-        # 优化：简化上下文信息
+        # 如果不是最后一个分块，尝试在句号、换行或标题后切分，避免在标题中间切分
+        if end_position < total_length:
+            # 向后查找合适的切分点（句号、换行、标题标记等）
+            lookahead = min(overlap, total_length - end_position)
+            for i in range(lookahead):
+                check_pos = end_position + i
+                if check_pos >= total_length:
+                    break
+                char = body[check_pos]
+                # 在句号、换行、标题编号后切分
+                if char in ['。', '.', '\n']:
+                    # 检查是否是标题编号后的句号
+                    if i > 0:
+                        prev_chars = body[max(0, check_pos-3):check_pos]
+                        if any(marker in prev_chars for marker in ['一、', '二、', '三、', '（一）', '（二）', '1.', '2.', '3.']):
+                            end_position = check_pos + 1
+                            chunk_text = body[position:end_position]
+                            break
+                    else:
+                        end_position = check_pos + 1
+                        chunk_text = body[position:end_position]
+                        break
+        
+        # 构建当前分块的 prompt
         context_info = ""
         if chunk_index > 0:
-            context_info = f"\n**片段 {chunk_index + 1}/{total_chunks}**：如开头是正文，保持type=\"body\"。\n"
+            context_info = f"\n**注意**：这是文档的第 {chunk_index + 1} 个片段（共约 {total_chunks} 个片段，前面已有 {chunk_index} 个片段处理完成）。"
+            context_info += "如果片段开头是正文段落（没有标题），说明它是上一个片段的延续，请保持类型为 \"body\"。\n"
         
-        prompt = base_prompt_template + context_info + f"【内容】:\n{chunk_text}"
+        prompt = base_prompt_template + context_info + f"【正文内容片段】:\n{chunk_text}"
         
-        # 优化：减少进度更新频率（每处理一个分块更新一次，但可以改为每2个）
-        progress = min(1.0, (chunk_index + 1) / total_chunks)
+        # 更新进度条
+        progress = (chunk_index + 1) / total_chunks
         progress_bar.progress(progress)
-        elapsed_str = f"{elapsed:.0f}秒" if elapsed > 0 else ""
-        status_text.text(f"处理片段 {chunk_index + 1}/{total_chunks} {elapsed_str}...")
+        status_text.text(f"正在处理文档片段 {chunk_index + 1}/{total_chunks}...")
         
-        # 优化：使用更短的超时和更少的重试
+        # 调用 LLM 处理当前分块
         try:
-            content = _call_zhipu_llm(
-                prompt=prompt, 
-                model="glm-4-flash", 
-                temperature=0.1, 
-                timeout=chunk_timeout,  # 18秒
-                max_retries=1  # 只重试1次（从2次减少）
-            )
+            content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
             
             if content:
                 data = _extract_json_from_text(content, bracket_type="[")
-                if isinstance(data, list) and len(data) > 0:
+                if isinstance(data, list):
+                    # 处理当前分块的 blocks
                     for item in data:
                         if not isinstance(item, dict):
                             continue
@@ -1081,32 +952,31 @@ def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: 
                         text = str(item.get("text", "")).strip()
                         if text:
                             all_blocks.append({"type": block_type, "text": text})
-                else:
-                    # 快速回退：解析失败时作为body处理
-                    if chunk_text.strip():
-                        all_blocks.append({"type": "body", "text": chunk_text.strip()})
             else:
-                # 快速回退：LLM返回空时作为body处理
+                # 如果当前分块处理失败，至少保留原始文本作为body
                 if chunk_text.strip():
                     all_blocks.append({"type": "body", "text": chunk_text.strip()})
         except Exception as e:
-            # 优化：快速失败，不显示详细错误（减少UI更新）
+            # 如果处理当前分块时出错，记录错误但继续处理下一个分块
+            import streamlit as st
+            st.warning(f"处理片段 {chunk_index + 1} 时出错: {str(e)[:100]}，跳过该片段")
+            # 至少保留原始文本
             if chunk_text.strip():
                 all_blocks.append({"type": "body", "text": chunk_text.strip()})
         
-        # 移动到下一个分块
+        # 移动到下一个分块（考虑重叠）
         new_position = end_position - overlap if end_position < total_length else end_position
+        # 防止死循环：确保position总是向前移动
         if new_position > position:
             position = new_position
         else:
-            # 防止死循环：强制推进至少chunk_size的10%
-            position = position + max(1, chunk_size // 10)
-        
+            # 如果position没有增加，强制推进
+            position = end_position
         chunk_index += 1
         
-        # 优化：减少最大分块数限制
-        if chunk_index > 30:  # 从100减少到30
-            st.warning(f"文档过长，已处理前30个片段，剩余内容将作为正文处理")
+        # 防止无限循环：如果处理的分块数过多，强制结束
+        if chunk_index > 100:  # 最多处理100个分块
+            st.warning(f"文档过长，已处理前100个片段，剩余内容将作为正文处理")
             if position < total_length:
                 remaining_text = body[position:].strip()
                 if remaining_text:
@@ -1117,260 +987,14 @@ def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: 
     progress_bar.empty()
     status_text.empty()
     
-    # 优化：使用更高效的方式合并相邻body块
-    if not all_blocks:
-        return []
-    
+    # 后处理：合并相邻的相同类型的 body 块
     merged_blocks: list[dict] = []
-    current_body = None
-    
-    for block in all_blocks:
-        block_type = block.get("type", "body")
-        text = block.get("text", "").strip()
-        
-        if not text:
-            continue
-        
-        if block_type == "body":
-            if current_body is None:
-                current_body = text
-            else:
-                current_body += "\n" + text
+    for i, block in enumerate(all_blocks):
+        if i > 0 and block.get("type") == "body" and merged_blocks and merged_blocks[-1].get("type") == "body":
+            # 合并相邻的 body 块
+            merged_blocks[-1]["text"] += "\n" + block.get("text", "")
         else:
-            # 遇到非body块，先保存之前的body块
-            if current_body:
-                merged_blocks.append({"type": "body", "text": current_body})
-                current_body = None
-            merged_blocks.append({"type": block_type, "text": text})
-    
-    # 保存最后一个body块
-    if current_body:
-        merged_blocks.append({"type": "body", "text": current_body})
-    
-    return merged_blocks
-
-
-def llm_segment_blocks_chunked_parallel(
-    format_requirements: str,
-    body: str,
-    chunk_size: int = 12000,
-    overlap: int = 200,
-    max_workers: int = 5,  # 最大并发数
-    max_total_time: int = 300  # 最多5分钟总处理时间
-) -> list[dict]:
-    """使用并行分块策略处理长文档的标题识别（适用于几万字论文）。
-    
-    Args:
-        format_requirements: 格式要求文本
-        body: 正文内容（可能很长）
-        chunk_size: 每个分块的最大字符数（默认12000）
-        overlap: 分块之间的重叠字符数（默认200）
-        max_workers: 最大并发处理数（默认5，可根据API限制调整）
-        max_total_time: 最大总处理时间（秒，默认300秒=5分钟）
-    
-    Returns:
-        合并后的 blocks 列表
-    """
-    if not body.strip():
-        return []
-    
-    total_length = len(body)
-    
-    # 优化：简化格式要求提取
-    format_summary = ""
-    if format_requirements and format_requirements.strip():
-        format_summary = format_requirements[:800]
-        key_patterns = [
-            r'标题[：:].*?[。\n]',
-            r'heading[：:].*?[。\n]',
-            r'字体[：:].*?[。\n]',
-            r'font[：:].*?[。\n]',
-        ]
-        key_info = []
-        for pattern in key_patterns:
-            matches = re.findall(pattern, format_summary, re.IGNORECASE)
-            key_info.extend(matches[:2])
-        if key_info:
-            format_summary = ' '.join(key_info[:5])
-    
-    # 精简prompt模板
-    base_prompt_template = (
-        "划分文档结构，输出JSON数组。每个元素：{\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"}\n\n"
-        "**类型**：\n"
-        "- title: 主标题\n"
-        "- heading1: 一级标题（\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
-        "- heading2: 二级标题（\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
-        "- body: 正文\n\n"
-        "**规则**：识别纯文本标题，正确标记type，不改写内容。\n"
-    )
-    
-    if format_summary:
-        base_prompt_template += f"**格式参考**：{format_summary}\n\n"
-    
-    base_prompt_template += "**输出**：仅JSON数组，无其他文字。\n\n"
-    
-    # 第一步：智能切分文档为多个块
-    chunks: list[Tuple[int, str]] = []  # (index, text)
-    position = 0
-    chunk_index = 0
-    
-    # 预编译正则表达式
-    heading_patterns = [
-        re.compile(r'^[一二三四五六七八九十]+[、.]'),
-        re.compile(r'^第[一二三四五六七八九十]+[章节部分]'),
-        re.compile(r'^\d+[、.]'),
-        re.compile(r'^[（(][一二三四五六七八九十]+[）)]'),
-        re.compile(r'^\d+\.\d+'),
-        re.compile(r'^\d+[）)]'),
-    ]
-    
-    while position < total_length:
-        end_position = min(position + chunk_size, total_length)
-        
-        if end_position < total_length:
-            lookahead_text = body[end_position:min(end_position + overlap, total_length)]
-            
-            # 快速查找切分点
-            best_break_pos = None
-            newline_match = re.search(r'\n+', lookahead_text)
-            if newline_match:
-                best_break_pos = end_position + newline_match.end()
-            elif re.search(r'[。.]\s*', lookahead_text):
-                period_match = re.search(r'[。.]\s*', lookahead_text)
-                best_break_pos = end_position + period_match.end()
-            
-            if best_break_pos:
-                end_position = best_break_pos
-        
-        chunk_text = body[position:end_position]
-        if chunk_text.strip():
-            chunks.append((chunk_index, chunk_text))
-        
-        new_position = end_position - overlap if end_position < total_length else end_position
-        if new_position > position:
-            position = new_position
-        else:
-            position = position + max(1, chunk_size // 10)
-        
-        chunk_index += 1
-        
-        # 限制最大分块数（避免过多）
-        if chunk_index > 100:
-            if position < total_length:
-                remaining = body[position:].strip()
-                if remaining:
-                    chunks.append((chunk_index, remaining))
-            break
-    
-    total_chunks = len(chunks)
-    if total_chunks == 0:
-        return []
-    
-    # 显示分块信息
-    st.info(f"📄 文档已分为 {total_chunks} 个片段，开始并行处理（最多 {max_workers} 个并发）...")
-    
-    # 创建进度条
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # 第二步：并行处理所有分块
-    all_blocks: list[Tuple[int, list[dict]]] = []  # (chunk_index, blocks)
-    errors: list[Tuple[int, str]] = []  # (chunk_index, error)
-    
-    start_time = time.time()
-    chunk_timeout = 18
-    
-    # 使用线程池并行处理
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_chunk = {
-            executor.submit(
-                _process_single_chunk,
-                idx,
-                text,
-                format_summary,
-                base_prompt_template,
-                total_chunks,
-                chunk_timeout
-            ): (idx, text)
-            for idx, text in chunks
-        }
-        
-        # 收集结果（按完成顺序，不按提交顺序）
-        completed = 0
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            chunk_idx, chunk_text = future_to_chunk[future]
-            completed += 1
-            
-            try:
-                result_idx, blocks, error = future.result(timeout=chunk_timeout + 5)
-                all_blocks.append((result_idx, blocks))
-                if error:
-                    errors.append((result_idx, error))
-            except Exception as e:
-                # 处理失败，添加为body
-                blocks = [{"type": "body", "text": chunk_text.strip()}] if chunk_text.strip() else []
-                all_blocks.append((chunk_idx, blocks))
-                errors.append((chunk_idx, str(e)[:100]))
-            
-            # 更新进度
-            progress = completed / total_chunks
-            progress_bar.progress(progress)
-            elapsed = time.time() - start_time
-            status_text.text(
-                f"处理进度: {completed}/{total_chunks} 片段完成 "
-                f"({elapsed:.0f}秒, 约 {elapsed/completed:.1f}秒/片段)"
-            )
-            
-            # 检查总时间
-            if elapsed > max_total_time:
-                st.warning(f"⏱️ 处理超时（{elapsed:.0f}秒），剩余 {total_chunks - completed} 个片段将作为正文处理")
-                # 为未完成的片段添加body块
-                for idx, text in chunks:
-                    if not any(b[0] == idx for b in all_blocks):
-                        all_blocks.append((idx, [{"type": "body", "text": text.strip()}]))
-                break
-    
-    # 清除进度条
-    progress_bar.empty()
-    status_text.empty()
-    
-    # 显示错误信息（如果有）
-    if errors:
-        error_count = len(errors)
-        st.warning(f"⚠️ {error_count} 个片段处理时出现错误，已回退为正文处理")
-    
-    # 第三步：按chunk_index排序并合并结果
-    all_blocks.sort(key=lambda x: x[0])
-    
-    # 合并所有blocks
-    merged_blocks: list[dict] = []
-    current_body = None
-    
-    for _, blocks in all_blocks:
-        for block in blocks:
-            block_type = block.get("type", "body")
-            text = block.get("text", "").strip()
-            
-            if not text:
-                continue
-            
-            if block_type == "body":
-                if current_body is None:
-                    current_body = text
-                else:
-                    current_body += "\n" + text
-            else:
-                if current_body:
-                    merged_blocks.append({"type": "body", "text": current_body})
-                    current_body = None
-                merged_blocks.append({"type": block_type, "text": text})
-    
-    if current_body:
-        merged_blocks.append({"type": "body", "text": current_body})
-    
-    total_time = time.time() - start_time
-    st.success(f"✅ 处理完成！共 {total_chunks} 个片段，耗时 {total_time:.1f}秒（平均 {total_time/total_chunks:.1f}秒/片段）")
+            merged_blocks.append(block)
     
     return merged_blocks
 
@@ -1378,68 +1002,78 @@ def llm_segment_blocks_chunked_parallel(
 def llm_segment_blocks(format_requirements: str, body: str) -> list[dict]:
     """使用智谱 LLM 直接将正文划分为 title / heading1 / heading2 / body 块，返回 JSON 列表。
     
-    对于长文档，自动选择处理策略：
-    - < 12000字符：单次处理
-    - 12000-50000字符：串行分块处理
-    - > 50000字符：并行分块处理
+    对于长文档（>8000字符），自动使用分块处理策略。
     """
-    body_length = len(body)
-    
-    if not body.strip():
-        return []
-    
-    # 超长文档：使用并行处理
-    if body_length > 50000:  # 5万字以上
-        st.info(f"📚 检测到长文档（{body_length}字符），使用并行处理模式...")
-        return llm_segment_blocks_chunked_parallel(format_requirements, body)
-    
-    # 中等长度：使用优化的串行分块处理
-    elif body_length > 12000:
+    # 如果文档较长，使用分块处理
+    if len(body) > 8000:
         return llm_segment_blocks_chunked(format_requirements, body)
     
-    # 短文档：单次处理
-    else:
-        format_guidance = ""
-        if format_requirements and format_requirements.strip():
-            format_guidance = (
-                "\n\n**格式要求参考**：\n"
-                "如果格式要求中提到了标题级别，请参考这些信息来准确识别标题层级。\n"
-            )
+    # 原有逻辑（短文档）
+    if not body.strip():
+        return []
 
-        # 优化：简化短文档的prompt（与分块版本保持一致）
-        prompt = (
-            "划分文档结构，输出JSON数组。每个元素：{\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"}\n\n"
-            "**类型**：\n"
-            "- title: 主标题\n"
-            "- heading1: 一级标题（\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
-            "- heading2: 二级标题（\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
-            "- body: 正文\n\n"
-            "**规则**：识别纯文本标题（\"一、\"、\"（一）\"、\"1.1\"等），正确标记type，不改写内容。\n"
-            f"{format_guidance}"
-            f"【格式要求】:\n{format_requirements[:1000]}\n\n"
-            f"【正文内容】:\n{body[:8000]}"
+    format_guidance = ""
+    if format_requirements and format_requirements.strip():
+        format_guidance = (
+            "\n\n**格式要求参考**：\n"
+            "如果格式要求中提到了标题级别（如\"一级标题\"、\"二级标题\"、\"标题字号\"等），"
+            "请参考这些信息来准确识别标题层级。\n"
         )
 
-        content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
-        if not content:
-            return []
+    prompt = (
+        "你是一名文档排版助手，请根据【格式要求】和【正文内容】准确划分结构，输出 JSON 数组。\n"
+        "每个元素必须是形如 {\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"} 的对象：\n\n"
+        "**标题类型**：\n"
+        "- title: 文档主标题（通常只有一个）\n"
+        "- heading1: 一级标题（如\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
+        "- heading2: 二级标题（如\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
+        "- body: 正文段落\n\n"
+        "**识别与标记规则（必须严格遵守）**：\n"
+        "- **重要**：即使没有Markdown标记（`#`），也要识别纯文本格式的标题（\"一、\"、\"（一）\"、\"(一)\"、\"1.1\"等），并做相应标记，确保文档生成时根据格式要求进行处理；\n"
+        "- **编号识别与标记**：\n"
+        "  * heading1: \"一、\"、\"二、\"、\"第一章\"、\"1.\"等开头的独立行，**必须标记为heading1**\n"
+        "  * heading2: \"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等开头的独立行（无论中文括号还是英文括号），**必须标记为heading2**\n"
+        "- **关键规则**：\n"
+        "  * 以\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等编号开头的行，**必须标记为heading2，绝对不能标记为body**\n"
+        "  * 嵌套编号层级：\"一、\"→heading1，\"（一）\"/(一)→heading2\n"
+        "  * 不要把带编号的标题标记为body\n"
+        "- **识别验证与标记确认**：\n"
+        "  * 识别到标题后，必须立即标记为对应的type（title/heading1/heading2），不能遗漏或错误标记\n"
+        "  * 如果格式要求中指定了标题格式，参考格式要求来识别和标记标题层级\n"
+        "  * 只拆分和标注结构，不改写内容\n\n"
+        "**示例**：\n"
+        "- \"一、事件概况\" → {\"type\": \"heading1\", \"text\": \"一、事件概况\"}\n"
+        "- \"(一)目标定位\" → {\"type\": \"heading2\", \"text\": \"(一)目标定位\"}\n\n"
+        "**输出要求**：\n"
+        "- 仅输出 JSON 数组，不要添加多余文字或解释；\n"
+        "- 确保 JSON 格式正确，可以被解析；\n"
+        "- 每个识别到的标题都必须有正确的type标记，确保文档生成时能根据格式要求进行处理。\n"
+        f"{format_guidance}"
+        f"【格式要求】:\n{format_requirements[:2000]}\n\n"
+        f"【正文内容】:\n{body[:8000]}"
+    )
 
-        data = _extract_json_from_text(content, bracket_type="[")
-        if not isinstance(data, list):
-            return []
+    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
+    if not content:
+        return []
 
-        blocks: list[dict] = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            block_type = str(item.get("type", "body"))
-            if block_type not in {"title", "heading1", "heading2", "body"}:
-                block_type = "body"
-            text = str(item.get("text", "")).strip()
-            if text:
-                blocks.append({"type": block_type, "text": text})
+    data = _extract_json_from_text(content, bracket_type="[")
+    if not isinstance(data, list):
+        return []
 
-        return blocks
+    blocks: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        block_type = str(item.get("type", "body"))
+        # 支持 title, heading1, heading2, body 四种类型
+        if block_type not in {"title", "heading1", "heading2", "body"}:
+            block_type = "body"
+        text = str(item.get("text", "")).strip()
+        if text:
+            blocks.append({"type": block_type, "text": text})
+
+    return blocks
 
 
 # ======================

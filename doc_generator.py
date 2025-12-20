@@ -7,13 +7,20 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Dict, Iterable, List, Literal, TypedDict
+from typing import Dict, Iterable, Literal, TypedDict
+import logging
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm, Pt
 from docx.oxml.ns import qn
+
+
+# 常量：中文字体集合（用于判断是否为中文文档）
+CHINESE_FONT_SET_LOWER = {"宋体", "黑体", "微软雅黑", "仿宋", "楷体"}
+
+logger = logging.getLogger(__name__)
 
 
 class Block(TypedDict):
@@ -61,9 +68,13 @@ def _apply_paragraph_style(p, style_cfg: Dict[str, object], block_type: str) -> 
         
         # 调试：显示实际读取的值（仅第一个body段落）
         if not hasattr(_apply_paragraph_style, "_debug_logged"):
-            import streamlit as st
-            font_cn = style_cfg.get("font_cn", "未设置")
-            st.write(f"🔍 调试 - body配置: first_line_chars={indent_chars}, font_cn={font_cn}, size_pt={size_pt}")
+            font_cn_dbg = style_cfg.get("font_cn", "未设置")
+            logger.debug(
+                "🔍 调试 - body配置: first_line_chars=%s, font_cn=%s, size_pt=%s",
+                indent_chars,
+                font_cn_dbg,
+                size_pt,
+            )
             _apply_paragraph_style._debug_logged = True
         
         try:
@@ -78,7 +89,7 @@ def _apply_paragraph_style(p, style_cfg: Dict[str, object], block_type: str) -> 
             if indent_chars_f == 0:
                 # 如果明确设置为0，检查是否是英文文档
                 font_cn = str(style_cfg.get("font_cn", "")).lower()
-                is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+                is_chinese_font = font_cn in {n.lower() for n in CHINESE_FONT_SET_LOWER}
                 
                 if not is_chinese_font and size_pt_f > 0:
                     # 英文文档：统一使用4.5字符（0.5英寸 = 1.27厘米）
@@ -91,7 +102,7 @@ def _apply_paragraph_style(p, style_cfg: Dict[str, object], block_type: str) -> 
                 # 应用缩进：中文通常2字符，英文统一4.5字符（0.5英寸）
                 # 检测是否为英文文档（通过字体判断）
                 font_cn = str(style_cfg.get("font_cn", "")).lower()
-                is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+                is_chinese_font = font_cn in {n.lower() for n in CHINESE_FONT_SET_LOWER}
                 
                 # 关键修复：对于英文文档（非中文字体），无论 indent_chars_f 的值是多少，
                 # 都应该使用固定的 0.5英寸 = 1.27厘米，而不是通过字符数×字号计算
@@ -109,7 +120,7 @@ def _apply_paragraph_style(p, style_cfg: Dict[str, object], block_type: str) -> 
             elif indent_chars_f is None:
                 # 配置缺失：根据字体判断默认值
                 font_cn = str(style_cfg.get("font_cn", "")).lower()
-                if font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"] and size_pt_f > 0:
+                if font_cn in {n.lower() for n in CHINESE_FONT_SET_LOWER} and size_pt_f > 0:
                     # 中文字体：2字符缩进
                     indent_cm = size_pt_f * 2.0 * 0.0352778
                     p.paragraph_format.first_line_indent = Cm(indent_cm)
@@ -190,6 +201,10 @@ def generate_docx(blocks: Iterable[Block], config: Dict[str, Dict[str, object]])
     for block in blocks:
         block_type = block.get("type", "body")
         text = clean_text(block.get("text", "") or "")
+
+        # 跳过空文本块，避免生成多余空段落
+        if not text:
+            continue
 
         # 选择对应的样式配置；支持 title, heading1, heading2, body
         # 如果 block_type 不在配置中，默认回退到 body
