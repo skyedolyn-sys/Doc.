@@ -85,9 +85,15 @@ def parse_markdown(content: str) -> List[ParsedBlock]:
     - 第一个以 # 开头的非空行 → type: "title"
     - 以 ## 开头的非空行 → type: "heading1"
     - 以 ### 开头的非空行 → type: "heading2"
+    - 中文编号格式：
+      - 以"一、"、"二、"、"第一章"、"1."等开头 → type: "heading1"
+      - 以"（一）"、"（二）"、"(一)"、"(二)"、"1.1"等开头 → type: "heading2"
     - 其他非空行 → type: "body"
     - 自动去掉行首的 # 及其后面的空格，只保留纯文本
+    - 忽略 Markdown 分割线（---、***、___等），不会出现在输出中
     """
+    import re
+    
     blocks: List[ParsedBlock] = []
     has_title = False
 
@@ -99,11 +105,20 @@ def parse_markdown(content: str) -> List[ParsedBlock]:
 
         stripped = line.lstrip()
         
-        # 判断标题层级
+        # 检查是否是 Markdown 分割线（三个或更多连续的 -、* 或 _）
+        # 匹配：---、***、___、----、**** 等，可能前后有空格
+        if re.match(r'^[\s]*[-*_]{3,}[\s]*$', stripped):
+            # 跳过分割线，不生成任何 block
+            continue
+        
+        block_type: ParsedBlock["type"] = "body"
+        text = stripped
+        
+        # 优先检查 Markdown 格式
         if stripped.startswith("###"):
             # 三级标题（二级标题）
             text = _strip_heading_marks(line)
-            block_type: ParsedBlock["type"] = "heading2"
+            block_type = "heading2"
         elif stripped.startswith("##"):
             # 二级标题（一级标题）
             text = _strip_heading_marks(line)
@@ -118,9 +133,28 @@ def parse_markdown(content: str) -> List[ParsedBlock]:
                 # 如果已经有title了，后续的 # 也作为 heading1 处理
                 block_type = "heading1"
         else:
-            # 正文
-            text = stripped
-            block_type = "body"
+            # 检查中文编号格式的一级标题
+            # 匹配：一、二、三、... 或 第一章、第二章、... 或 1. 2. 3. ...
+            if re.match(r'^[一二三四五六七八九十]+[、.]', stripped) or \
+               re.match(r'^第[一二三四五六七八九十]+[章节部分]', stripped) or \
+               re.match(r'^\d+[、.]', stripped):
+                if not has_title:
+                    block_type = "title"
+                    has_title = True
+                else:
+                    block_type = "heading1"
+                text = stripped
+            # 检查中文编号格式的二级标题
+            # 匹配：（一）、（二）、... 或 (一)、(二)、... 或 1.1、2.1、... 或 1）、2）、...
+            elif re.match(r'^[（(][一二三四五六七八九十]+[）)]', stripped) or \
+                 re.match(r'^\d+\.\d+', stripped) or \
+                 re.match(r'^\d+[）)]', stripped):
+                block_type = "heading2"
+                text = stripped
+            else:
+                # 正文
+                text = stripped
+                block_type = "body"
 
         if text:  # 避免空文本块
             blocks.append(ParsedBlock(type=block_type, text=text))

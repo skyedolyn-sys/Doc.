@@ -52,18 +52,71 @@ def _apply_paragraph_style(p, style_cfg: Dict[str, object], block_type: str) -> 
     if line_spacing and block_type == "body":
         p.paragraph_format.line_spacing = float(line_spacing)
 
-    # 正文首行缩进（以"字符数"估算成厘米）
+    # 正文首行缩进（以\"字符数\"估算成厘米）
     # 注意：只有 body 类型需要首行缩进，title/heading1/heading2 不需要
     if block_type == "body":
-        indent_chars = style_cfg.get("first_line_chars", 2)
+        # 关键修复：不使用默认值2，应该从配置中获取或根据字体判断
+        indent_chars = style_cfg.get("first_line_chars")  # 移除默认值2
         size_pt = style_cfg.get("size_pt")
+        
+        # 调试：显示实际读取的值（仅第一个body段落）
+        if not hasattr(_apply_paragraph_style, "_debug_logged"):
+            import streamlit as st
+            font_cn = style_cfg.get("font_cn", "未设置")
+            st.write(f"🔍 调试 - body配置: first_line_chars={indent_chars}, font_cn={font_cn}, size_pt={size_pt}")
+            _apply_paragraph_style._debug_logged = True
+        
         try:
-            indent_chars_f = float(indent_chars) if indent_chars is not None else 0.0
+            indent_chars_f = float(indent_chars) if indent_chars is not None else None
             size_pt_f = float(size_pt) if size_pt is not None else 0.0
-            if indent_chars_f > 0 and size_pt_f > 0:
-                # 1 pt ≈ 0.0352778 cm；两字符缩进 = 字号 * 2
-                indent_cm = size_pt_f * indent_chars_f * 0.0352778
+            
+            # 区分不同情景：
+            # - 0：如果明确设置为0且是英文文档，会被统一调整为4.5字符
+            # - > 0：应用缩进（中文2字符，英文统一4.5字符）
+            # - None：根据字体判断默认值（中文字体→2，英文字体→4.5）
+            
+            if indent_chars_f == 0:
+                # 如果明确设置为0，检查是否是英文文档
+                font_cn = str(style_cfg.get("font_cn", "")).lower()
+                is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+                
+                if not is_chinese_font and size_pt_f > 0:
+                    # 英文文档：统一使用4.5字符（0.5英寸 = 1.27厘米）
+                    indent_cm = 1.27
+                    p.paragraph_format.first_line_indent = Cm(indent_cm)
+                else:
+                    # 中文文档：不缩进
+                    p.paragraph_format.first_line_indent = Cm(0)
+            elif indent_chars_f is not None and indent_chars_f > 0 and size_pt_f > 0:
+                # 应用缩进：中文通常2字符，英文统一4.5字符（0.5英寸）
+                # 检测是否为英文文档（通过字体判断）
+                font_cn = str(style_cfg.get("font_cn", "")).lower()
+                is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+                
+                # 关键修复：对于英文文档（非中文字体），无论 indent_chars_f 的值是多少，
+                # 都应该使用固定的 0.5英寸 = 1.27厘米，而不是通过字符数×字号计算
+                # 因为字符宽度在不同字体下不同，不能通过字符数×字号计算
+                if not is_chinese_font:
+                    # 英文文档：统一使用0.5英寸 = 1.27厘米（固定值）
+                    # 不依赖 indent_chars_f 的具体值，因为对于英文文档，0.5英寸是标准缩进
+                    indent_cm = 1.27
+                else:
+                    # 中文文档：使用字符数计算
+                    # 1 pt ≈ 0.0352778 cm；缩进 = 字号 * 字符数 * 0.0352778
+                    indent_cm = size_pt_f * indent_chars_f * 0.0352778
+                
                 p.paragraph_format.first_line_indent = Cm(indent_cm)
+            elif indent_chars_f is None:
+                # 配置缺失：根据字体判断默认值
+                font_cn = str(style_cfg.get("font_cn", "")).lower()
+                if font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"] and size_pt_f > 0:
+                    # 中文字体：2字符缩进
+                    indent_cm = size_pt_f * 2.0 * 0.0352778
+                    p.paragraph_format.first_line_indent = Cm(indent_cm)
+                elif size_pt_f > 0:
+                    # 英文字体：统一使用4.5字符（0.5英寸 = 1.27厘米）
+                    indent_cm = 1.27
+                    p.paragraph_format.first_line_indent = Cm(indent_cm)
         except (TypeError, ValueError):
             # 如果配置异常，跳过缩进设置
             pass

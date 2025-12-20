@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -124,6 +125,8 @@ def _call_zhipu_llm(
     temperature: float = 0.1,
     image_url: str | None = None,
     image_urls: list[str] | None = None,
+    timeout: int = 30,
+    max_retries: int = 2,
 ) -> str:
     """通用ZhipuAI LLM调用函数。
     
@@ -133,6 +136,8 @@ def _call_zhipu_llm(
         temperature: 温度参数，默认为 0.1
         image_url: 可选的单张图片URL（用于多模态调用）
         image_urls: 可选的多张图片URL列表（用于一次性处理整个PDF）
+        timeout: 超时时间（秒），默认30秒
+        max_retries: 最大重试次数，默认2次
     
     Returns:
         模型返回的文本内容，如果调用失败则返回空字符串
@@ -141,40 +146,50 @@ def _call_zhipu_llm(
     if not client:
         return ""
     
-    try:
-        if image_urls:
-            # 多图片调用：一次性发送整个PDF的所有页面给AI
-            content_items = [{"type": "text", "text": prompt}]
-            for img_url in image_urls:
-                content_items.append({
-                    "type": "image_url",
-                    "image_url": {"url": img_url}
-                })
-            messages = [{"role": "user", "content": content_items}]
-        elif image_url:
-            # 单图片调用（保持兼容）
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }
-            ]
-        else:
-            # 纯文本调用
-            messages = [{"role": "user", "content": prompt}]
-        
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        return content
-    except Exception:
-        return ""
+    for attempt in range(max_retries + 1):
+        try:
+            if image_urls:
+                # 多图片调用：一次性发送整个PDF的所有页面给AI
+                content_items = [{"type": "text", "text": prompt}]
+                for img_url in image_urls:
+                    content_items.append({
+                        "type": "image_url",
+                        "image_url": {"url": img_url}
+                    })
+                messages = [{"role": "user", "content": content_items}]
+            elif image_url:
+                # 单图片调用（保持兼容）
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ]
+            else:
+                # 纯文本调用
+                messages = [{"role": "user", "content": prompt}]
+            
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                timeout=timeout,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            return content
+        except Exception as e:
+            if attempt < max_retries:
+                import time
+                time.sleep(1)  # 等待1秒后重试
+                continue
+            else:
+                import streamlit as st
+                st.warning(f"LLM调用失败（已重试{max_retries}次）: {str(e)[:100]}")
+                return ""
+    return ""
 
 
 def _extract_json_from_text(content: str, bracket_type: str = "{") -> dict | list | None:
@@ -322,6 +337,7 @@ def zhipu_ocr_from_pdf(raw: bytes, max_pages: int | None = None) -> str:
                 model="glm-4v",
                 temperature=0.1,
                 image_url=data_url,
+                timeout=60,  # 多模态模型需要更长时间
             )
             if content:
                 page_texts.append(content)
@@ -355,6 +371,10 @@ def extract_format_from_image(raw: bytes) -> str:
             "- 段落格式（如首行缩进2字符、段前段后间距）\n"
             "- 引用/脚注/参考文献格式要求\n"
             "- 页眉页脚、页码格式等\n\n"
+            "**重要：格式要求的语言区分**：\n"
+            "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），必须保留这些语言区分标记\n"
+            "- 如果格式要求没有明确指定语言，根据格式描述的语种判断：中文描述=中文格式要求，英文描述=英文格式要求\n"
+            "- 如果同时包含中英文格式要求，保持原文的排列顺序，或先中文后英文\n\n"
             "**严格排除以下非格式内容**：\n"
             "- 课程名称、课程介绍、课程目标\n"
             "- 作业题目、写作主题、内容要求\n"
@@ -373,23 +393,92 @@ def extract_format_from_image(raw: bytes) -> str:
             model="glm-4v",
             temperature=0.1,
             image_url=data_url,
+            timeout=60,  # 多模态模型需要更长时间
         )
     except Exception:
         return ""
 
 
-def extract_format_from_pdf(raw: bytes, max_pages: int = 3) -> str:
-    """使用智谱多模态模型直接从PDF中识别并提取格式要求。
+def _clean_format_output(content: str) -> str:
+    """清理格式要求输出，移除解释性文字和重复内容。"""
+    if not content or not content.strip():
+        return ""
     
-    优化：将整个PDF的所有页面一次性发送给AI，让AI自行处理。
-    AI可以：
-    - 浏览整个PDF，自行判断哪些页面包含格式要求
-    - 自动去重和合并多页的格式要求
-    - 一次性处理，速度更快
+    lines = content.strip().split('\n')
+    cleaned_lines = []
+    seen = set()
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        
+        # 检查是否包含格式关键词
+        has_format_keyword = any(fmt_marker in line_stripped for fmt_marker in [
+            # 中文格式关键词
+            "pt", "cm", "倍", "行距", "字体", "字号", "页边距", 
+            "缩进", "对齐", "加粗", "居中", "A4", "Letter",
+            "宋体", "黑体", "Times", "Roman", "Calibri",
+            # 英文格式关键词
+            "spacing", "margin", "font", "size", "alignment", "indent",
+            "bold", "italic", "center", "left", "right", "justify",
+            "header", "footer", "page number", "citation", "reference",
+            "APA", "MLA", "Chicago", "double", "single", "inch", "inches",
+            "Times New Roman", "Calibri", "Arial", "Helvetica"
+        ])
+        
+        # 跳过解释性文字
+        if any(marker in line_stripped for marker in [
+            "示例输出", "**示例", "---", "###", 
+            "以下是", "提取结果", "识别结果",
+            "**注意**", "**注意", "注意：", "注意",
+            "由于", "无法", "需要您", "需要你", "因此",
+            "清晰度", "问题", "实际操作", "细致", "阅读", "标注"
+        ]):
+            if not has_format_keyword:
+                continue
+        
+        # 检查是否是解释性提示
+        explanation_patterns = [
+            r'^\*\*注意\*\*.*',
+            r'^注意：.*',
+            r'.*由于.*清晰度.*问题.*',
+            r'.*无法.*识别.*',
+            r'.*需要您.*',
+            r'.*需要你.*',
+            r'.*实际操作.*',
+            r'.*细致.*阅读.*标注.*'
+        ]
+        is_explanation = any(re.match(pattern, line_stripped) for pattern in explanation_patterns)
+        if is_explanation and not has_format_keyword:
+            continue
+        
+        # 对于包含"第"、"页"的行，需要更谨慎处理
+        if any(marker in line_stripped for marker in ["第", "页", "页面", "Page", "PAGE"]):
+            is_page_marker_only = (
+                re.match(r'^第\s*\d+\s*页\s*$', line_stripped) or 
+                re.match(r'^Page\s*\d+\s*$', line_stripped, re.IGNORECASE) or
+                re.match(r'^页面\s*\d+\s*$', line_stripped)
+            )
+            if is_page_marker_only and not has_format_keyword:
+                continue
+        
+        # 去重
+        if line_stripped not in seen:
+            seen.add(line_stripped)
+            cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines).strip()
+
+
+def extract_format_from_pdf(raw: bytes, max_pages: int = 5) -> str:
+    """使用智谱多模态模型逐页识别并提取格式要求。
+    
+    采用逐页处理策略，确保每一页都被独立检查，不会遗漏任何格式要求。
     
     Args:
         raw: PDF 文件的字节数据
-        max_pages: 最大检查页数，格式要求通常在前几页
+        max_pages: 最大检查页数，格式要求通常在前几页（默认5页）
     
     Returns:
         提取的格式要求文本
@@ -400,74 +489,68 @@ def extract_format_from_pdf(raw: bytes, max_pages: int = 3) -> str:
 
     try:
         # 将PDF转换为图片（AI需要图片格式）
-        images = convert_from_bytes(raw, dpi=200)  # 降低DPI以加快速度
-        # 只处理前几页（格式要求通常在前几页）
+        images = convert_from_bytes(raw, dpi=200)
         if max_pages > 0:
             images = images[:max_pages]
         
         if not images:
             return ""
         
-        # 将所有页面转换为base64，准备一次性发送给AI
-        image_urls: list[str] = []
-        for img in images:
+        all_format_texts = []
+        total_pages = len(images)
+        
+        # 逐页处理，确保每一页都被独立检查
+        for page_idx, img in enumerate(images, 1):
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)  # 降低质量以减小文件大小
+            img.save(buf, format="JPEG", quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             data_url = f"data:image/jpeg;base64,{b64}"
-            image_urls.append(data_url)
+            
+            prompt = (
+                f"这是PDF文档的第{page_idx}页（共{total_pages}页）。请检查这一页是否包含【排版/格式要求】。\n\n"
+                "**任务**：\n"
+                "- 判断这一页是否包含格式要求\n"
+                "- 如果包含格式要求，提取所有格式要求内容，并明确区分中文格式要求和英文格式要求\n"
+                "- 如果不包含格式要求，返回空字符串\n\n"
+                "**格式要求的识别与区分标准**：\n"
+                "- **中文格式要求**（适用于中文文本）：包含中文描述或中文格式术语，如\"1.5倍行距\"、\"宋体小四\"、\"黑体三号\"、\"首行缩进2字符\"、\"段前段后间距\"、\"左对齐\"、\"居中\"等\n"
+                "- **英文格式要求**（适用于英文文本）：包含英文描述或英文格式术语，如\"double spacing\"、\"Times New Roman\"、\"1-inch margins\"、\"APA 7th edition\"、\"centered\"、\"bold\"、\"left-aligned\"、\"first-line indent\"等\n"
+                "- 通用格式要素（中英文都要识别）：字体、字号（如\"12pt\"、\"2.5cm\"、\"A4\"）、行距、页边距、对齐方式、缩进、标题格式、引用格式（APA、MLA、Chicago等）、页眉页脚、页码格式等\n\n"
+                "**提取规则**：\n"
+                "- **必须同时识别和提取中文格式要求和英文格式要求**，不能遗漏任何一种语言\n"
+                "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），必须保留这些语言区分标记\n"
+                "- 如果格式要求没有明确指定语言，根据格式描述的语种判断：中文描述=中文格式要求，英文描述=英文格式要求\n"
+                "- 保持原文语言，不要翻译格式要求\n\n"
+                "**严格排除的内容**（不要提取）：\n"
+                "- 课程名称、课程介绍、课程目标\n"
+                "- 作业题目、写作主题、内容要求\n"
+                "- 字数要求、提交时间、截止日期\n"
+                "- 评分标准、评分细则、课程安排\n"
+                "- 参考文献列表、课程资料等非格式内容\n\n"
+                "**输出要求**：\n"
+                "- 如果同时包含中英文格式要求，保持原文的排列顺序，或先中文后英文\n"
+                "- 如果格式要求明确区分了适用语言，保留这些区分标记（如\"中文部分\"、\"English section\"等）\n"
+                "- 只输出格式要求文本，不要添加解释、总结或前后缀\n"
+                "- **绝对不要输出任何解释性文字**，如\"注意\"、\"由于\"、\"无法识别\"等\n"
+                "- 如果这一页没有格式要求，返回空字符串"
+            )
+            
+            content = _call_zhipu_llm(
+                prompt=prompt,
+                model="glm-4v",
+                temperature=0.1,
+                image_url=data_url,
+                timeout=60,  # 多模态模型需要更长时间
+            )
+            
+            if content and content.strip():
+                # 清理这一页的输出
+                cleaned_content = _clean_format_output(content)
+                if cleaned_content:
+                    all_format_texts.append(cleaned_content)
         
-        # 一次性发送整个PDF给AI，让AI自行处理
-        prompt = (
-            "这是课程 syllabus 或作业说明的PDF文档（共{}页）。请识别并提取其中的【排版/格式要求】部分。\n\n"
-            "**任务**：\n"
-            "- 浏览所有页面，识别哪些页面包含格式要求\n"
-            "- 只提取格式要求相关的内容\n"
-            "- 如果多页都有格式要求，合并提取，避免重复\n\n"
-            "**格式要求特征**：\n"
-            "- 包含具体数值和单位（如\"12pt\"、\"2.5cm\"、\"A4\"、\"1.5倍行距\"等）\n"
-            "- 描述排版样式（字体、字号、行距、页边距等）\n"
-            "- 通常出现在文档开头或独立章节中\n\n"
-            "**需要提取的内容**：\n"
-            "- 纸张大小、页边距、字体字号、行距、标题样式、段落格式、引用格式、页眉页脚等\n\n"
-            "**严格排除**：\n"
-            "- 课程名称、作业题目、内容要求、字数要求、提交时间、评分标准等\n\n"
-            "**输出要求**：\n"
-            "- 只转写原文中的格式要求，不要改写、不要补充\n"
-            "- 如果多页都有格式要求，合并输出，避免重复\n"
-            "- 不要输出示例、列表格式（如\"**示例输出**\"、\"- 纸张大小\"等）\n"
-            "- 不要输出解释，只转写原文内容\n"
-            "- 逐字转写，保持原文表述"
-        ).format(len(image_urls))
-
-        # 一次性发送整个PDF的所有页面给AI
-        content = _call_zhipu_llm(
-            prompt=prompt,
-            model="glm-4v",
-            temperature=0.1,
-            image_urls=image_urls,  # 使用多图片输入，让AI看到整个PDF
-        )
-        
-        if not content or not content.strip():
-            return ""
-        
-        # 清理输出：移除明显的重复标记和示例格式
-        lines = content.strip().split('\n')
-        cleaned_lines = []
-        seen = set()
-        for line in lines:
-            line_stripped = line.strip()
-            # 跳过空行和明显的重复标记
-            if not line_stripped:
-                continue
-            if any(marker in line_stripped for marker in ["示例输出", "**示例", "---", "###"]):
-                continue
-            # 去重：跳过完全相同的行
-            if line_stripped not in seen:
-                seen.add(line_stripped)
-                cleaned_lines.append(line)
-        
-        return '\n'.join(cleaned_lines).strip()
+        # 合并所有页面的格式要求
+        return '\n\n'.join(all_format_texts).strip()
     except Exception:
         return ""
 
@@ -533,10 +616,81 @@ def extract_format_from_text_file(raw: bytes, file_type: str) -> str:
             f"文档内容：\n{text[:6000]}"
         )
         
-        return _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1)
+        return _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
     
     except Exception:
         return ""
+
+
+# ======================
+# 常用格式库
+# ======================
+
+FORMAT_TEMPLATES = {
+    "APA 7th Edition": """纸张大小：A4
+页边距：上下左右均为2.54cm（1英寸）
+字体：Times New Roman 12pt（英文）或宋体小四（中文）
+行距：双倍行距（double spacing）
+标题格式：
+- 一级标题：加粗居中，首字母大写
+- 二级标题：加粗左对齐，首字母大写
+- 三级标题：加粗缩进，首字母大写，句末加句号
+段落格式：首行不缩进，段落之间空一行
+引用格式：作者-日期格式（Author-Date），如 (Smith, 2020)
+参考文献：悬挂缩进0.5英寸，按作者姓氏字母顺序排列
+页眉：标题（前50个字符），右对齐
+页码：右上角，从标题页开始编号""",
+
+    "MLA 9th Edition": """纸张大小：Letter（8.5 x 11英寸）或A4
+页边距：上下左右均为2.54cm（1英寸）
+字体：Times New Roman 12pt
+行距：双倍行距（double spacing）
+标题格式：无特殊格式要求，标题居中
+段落格式：首行缩进0.5英寸（1.27cm）
+引用格式：作者-页码格式，如 (Smith 45)
+参考文献：标题为"Works Cited"，悬挂缩进0.5英寸，按作者姓氏字母顺序排列
+页眉：右上角显示姓氏和页码，如 Smith 1
+页码：从第一页开始编号""",
+
+    "Chicago 17th Edition": """纸张大小：Letter或A4
+页边距：上下左右均为2.54cm（1英寸）
+字体：Times New Roman 12pt
+行距：双倍行距（double spacing）
+标题格式：标题居中，加粗
+段落格式：首行缩进0.5英寸（1.27cm）
+引用格式：脚注或尾注格式，如 ¹ 或 [1]
+参考文献：标题为"Bibliography"或"Works Cited"，悬挂缩进0.5英寸
+页眉：无特殊要求
+页码：从第一页开始编号，右上角或底部居中""",
+
+    "IEEE": """纸张大小：Letter或A4
+页边距：上下2.54cm，左右1.91cm（0.75英寸）
+字体：Times New Roman 10pt
+行距：单倍行距（single spacing）
+标题格式：
+- 一级标题：14pt，加粗，左对齐，大写
+- 二级标题：12pt，加粗，左对齐
+- 三级标题：10pt，加粗，左对齐，斜体
+段落格式：首行不缩进，段落之间空一行
+引用格式：数字引用格式，如 [1], [2-5]
+参考文献：标题为"References"，按引用顺序编号
+页眉：无特殊要求
+页码：从第一页开始编号""",
+
+    "GB/T 7714-2015（中文）": """纸张大小：A4
+页边距：上下2.5cm，左右3cm
+字体：中文使用宋体，英文使用Times New Roman；正文小四号（12pt）
+行距：1.5倍行距
+标题格式：
+- 一级标题：黑体三号，居中
+- 二级标题：黑体四号，左对齐
+- 三级标题：黑体小四号，左对齐
+段落格式：首行缩进2字符
+引用格式：作者-出版年格式，如（张三，2020）
+参考文献：标题为"参考文献"，悬挂缩进，按引用顺序编号
+页眉：无特殊要求
+页码：底部居中，从正文开始编号"""
+}
 
 
 def extract_format_requirements_unified(uploaded_file) -> str:
@@ -561,7 +715,7 @@ def extract_format_requirements_unified(uploaded_file) -> str:
     
     elif suffix == ".pdf":
         # PDF文件：直接使用多模态AI
-        return extract_format_from_pdf(file_bytes, max_pages=3)
+        return extract_format_from_pdf(file_bytes, max_pages=5)
     
     elif suffix in {".html", ".htm", ".md", ".markdown"}:
         # HTML/MD文件：直接用AI读取文本并识别格式要求
@@ -592,6 +746,10 @@ def llm_extract_format_only(text: str) -> str:
         "- 段落格式（如首行缩进2字符、段前段后间距）\n"
         "- 引用/脚注/参考文献格式要求\n"
         "- 页眉页脚、页码格式等\n\n"
+        "**重要：格式要求的语言区分**：\n"
+        "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），必须保留这些语言区分标记\n"
+        "- 如果格式要求没有明确指定语言，根据格式描述的语种判断：中文描述=中文格式要求，英文描述=英文格式要求\n"
+        "- 如果同时包含中英文格式要求，保持原文的排列顺序，或先中文后英文\n\n"
         "**严格排除以下非格式内容**：\n"
         "- 课程名称、课程介绍、课程目标、课程大纲\n"
         "- 作业题目、写作主题、内容要求、写作指导\n"
@@ -649,7 +807,7 @@ def llm_enhance_markdown(text: str, format_requirements: str = "") -> str:
         f"\n原始文本：\n{text[:6000]}"
     )
 
-    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.2)
+    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.2, timeout=30)
     if not content:
         return text
 
@@ -668,8 +826,189 @@ def llm_enhance_markdown(text: str, format_requirements: str = "") -> str:
     return content
 
 
+def llm_segment_blocks_chunked(format_requirements: str, body: str, chunk_size: int = 6000, overlap: int = 500) -> list[dict]:
+    """使用分块策略处理长文档的标题识别。
+    
+    Args:
+        format_requirements: 格式要求文本
+        body: 正文内容（可能很长）
+        chunk_size: 每个分块的最大字符数（默认6000，留出prompt空间）
+        overlap: 分块之间的重叠字符数（默认500，避免在标题中间切分）
+    
+    Returns:
+        合并后的 blocks 列表
+    """
+    if not body.strip():
+        return []
+    
+    all_blocks: list[dict] = []
+    total_length = len(body)
+    position = 0
+    
+    format_guidance = ""
+    if format_requirements and format_requirements.strip():
+        format_guidance = (
+            "\n\n**格式要求参考**：\n"
+            "如果格式要求中提到了标题级别（如\"一级标题\"、\"二级标题\"、\"标题字号\"等），"
+            "请参考这些信息来准确识别标题层级。\n"
+        )
+    
+    # 基础 prompt 模板
+    base_prompt_template = (
+        "你是一名文档排版助手，请根据【格式要求】和【正文内容片段】准确划分结构，输出 JSON 数组。\n"
+        "每个元素必须是形如 {\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"} 的对象：\n\n"
+        "**标题类型**：\n"
+        "- title: 文档主标题（通常只有一个）\n"
+        "- heading1: 一级标题（如\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
+        "- heading2: 二级标题（如\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
+        "- body: 正文段落\n\n"
+        "**识别与标记规则（必须严格遵守）**：\n"
+        "- **重要**：即使没有Markdown标记（`#`），也要识别纯文本格式的标题（\"一、\"、\"（一）\"、\"(一)\"、\"1.1\"等），并做相应标记，确保文档生成时根据格式要求进行处理；\n"
+        "- **编号识别与标记**：\n"
+        "  * heading1: \"一、\"、\"二、\"、\"第一章\"、\"1.\"等开头的独立行，**必须标记为heading1**\n"
+        "  * heading2: \"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等开头的独立行（无论中文括号还是英文括号），**必须标记为heading2**\n"
+        "- **关键规则**：\n"
+        "  * 以\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等编号开头的行，**必须标记为heading2，绝对不能标记为body**\n"
+        "  * 嵌套编号层级：\"一、\"→heading1，\"（一）\"/(一)→heading2\n"
+        "  * 不要把带编号的标题标记为body\n"
+        "- **识别验证与标记确认**：\n"
+        "  * 识别到标题后，必须立即标记为对应的type（title/heading1/heading2），不能遗漏或错误标记\n"
+        "  * 如果格式要求中指定了标题格式，参考格式要求来识别和标记标题层级\n"
+        "  * 只拆分和标注结构，不改写内容\n\n"
+        "**示例**：\n"
+        "- \"一、事件概况\" → {\"type\": \"heading1\", \"text\": \"一、事件概况\"}\n"
+        "- \"(一)目标定位\" → {\"type\": \"heading2\", \"text\": \"(一)目标定位\"}\n\n"
+        "**输出要求**：\n"
+        "- 仅输出 JSON 数组，不要添加多余文字或解释；\n"
+        "- 确保 JSON 格式正确，可以被解析；\n"
+        "- 每个识别到的标题都必须有正确的type标记，确保文档生成时能根据格式要求进行处理。\n"
+        f"{format_guidance}"
+        f"【格式要求】:\n{format_requirements[:2000]}\n\n"
+    )
+    
+    chunk_index = 0
+    total_chunks = (total_length + chunk_size - 1) // chunk_size  # 估算总块数
+    
+    # 创建进度条
+    import streamlit as st
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    while position < total_length:
+        # 计算当前分块的结束位置
+        end_position = min(position + chunk_size, total_length)
+        chunk_text = body[position:end_position]
+        
+        # 如果不是最后一个分块，尝试在句号、换行或标题后切分，避免在标题中间切分
+        if end_position < total_length:
+            # 向后查找合适的切分点（句号、换行、标题标记等）
+            lookahead = min(overlap, total_length - end_position)
+            for i in range(lookahead):
+                check_pos = end_position + i
+                if check_pos >= total_length:
+                    break
+                char = body[check_pos]
+                # 在句号、换行、标题编号后切分
+                if char in ['。', '.', '\n']:
+                    # 检查是否是标题编号后的句号
+                    if i > 0:
+                        prev_chars = body[max(0, check_pos-3):check_pos]
+                        if any(marker in prev_chars for marker in ['一、', '二、', '三、', '（一）', '（二）', '1.', '2.', '3.']):
+                            end_position = check_pos + 1
+                            chunk_text = body[position:end_position]
+                            break
+                    else:
+                        end_position = check_pos + 1
+                        chunk_text = body[position:end_position]
+                        break
+        
+        # 构建当前分块的 prompt
+        context_info = ""
+        if chunk_index > 0:
+            context_info = f"\n**注意**：这是文档的第 {chunk_index + 1} 个片段（共约 {total_chunks} 个片段，前面已有 {chunk_index} 个片段处理完成）。"
+            context_info += "如果片段开头是正文段落（没有标题），说明它是上一个片段的延续，请保持类型为 \"body\"。\n"
+        
+        prompt = base_prompt_template + context_info + f"【正文内容片段】:\n{chunk_text}"
+        
+        # 更新进度条
+        progress = (chunk_index + 1) / total_chunks
+        progress_bar.progress(progress)
+        status_text.text(f"正在处理文档片段 {chunk_index + 1}/{total_chunks}...")
+        
+        # 调用 LLM 处理当前分块
+        try:
+            content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
+            
+            if content:
+                data = _extract_json_from_text(content, bracket_type="[")
+                if isinstance(data, list):
+                    # 处理当前分块的 blocks
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        block_type = str(item.get("type", "body"))
+                        if block_type not in {"title", "heading1", "heading2", "body"}:
+                            block_type = "body"
+                        text = str(item.get("text", "")).strip()
+                        if text:
+                            all_blocks.append({"type": block_type, "text": text})
+            else:
+                # 如果当前分块处理失败，至少保留原始文本作为body
+                if chunk_text.strip():
+                    all_blocks.append({"type": "body", "text": chunk_text.strip()})
+        except Exception as e:
+            # 如果处理当前分块时出错，记录错误但继续处理下一个分块
+            import streamlit as st
+            st.warning(f"处理片段 {chunk_index + 1} 时出错: {str(e)[:100]}，跳过该片段")
+            # 至少保留原始文本
+            if chunk_text.strip():
+                all_blocks.append({"type": "body", "text": chunk_text.strip()})
+        
+        # 移动到下一个分块（考虑重叠）
+        new_position = end_position - overlap if end_position < total_length else end_position
+        # 防止死循环：确保position总是向前移动
+        if new_position > position:
+            position = new_position
+        else:
+            # 如果position没有增加，强制推进
+            position = end_position
+        chunk_index += 1
+        
+        # 防止无限循环：如果处理的分块数过多，强制结束
+        if chunk_index > 100:  # 最多处理100个分块
+            st.warning(f"文档过长，已处理前100个片段，剩余内容将作为正文处理")
+            if position < total_length:
+                remaining_text = body[position:].strip()
+                if remaining_text:
+                    all_blocks.append({"type": "body", "text": remaining_text})
+            break
+    
+    # 清除进度条
+    progress_bar.empty()
+    status_text.empty()
+    
+    # 后处理：合并相邻的相同类型的 body 块
+    merged_blocks: list[dict] = []
+    for i, block in enumerate(all_blocks):
+        if i > 0 and block.get("type") == "body" and merged_blocks and merged_blocks[-1].get("type") == "body":
+            # 合并相邻的 body 块
+            merged_blocks[-1]["text"] += "\n" + block.get("text", "")
+        else:
+            merged_blocks.append(block)
+    
+    return merged_blocks
+
+
 def llm_segment_blocks(format_requirements: str, body: str) -> list[dict]:
-    """使用智谱 LLM 直接将正文划分为 title / heading1 / heading2 / body 块，返回 JSON 列表。"""
+    """使用智谱 LLM 直接将正文划分为 title / heading1 / heading2 / body 块，返回 JSON 列表。
+    
+    对于长文档（>8000字符），自动使用分块处理策略。
+    """
+    # 如果文档较长，使用分块处理
+    if len(body) > 8000:
+        return llm_segment_blocks_chunked(format_requirements, body)
+    
+    # 原有逻辑（短文档）
     if not body.strip():
         return []
 
@@ -684,27 +1023,37 @@ def llm_segment_blocks(format_requirements: str, body: str) -> list[dict]:
     prompt = (
         "你是一名文档排版助手，请根据【格式要求】和【正文内容】准确划分结构，输出 JSON 数组。\n"
         "每个元素必须是形如 {\"type\": \"title|heading1|heading2|body\", \"text\": \"...\"} 的对象：\n\n"
-        "**标题类型说明**：\n"
-        "- type 为 \"title\" 表示整篇文档主标题（通常只有一个或极少数几个，如\"管理思维课程报告\"）\n"
-        "- type 为 \"heading1\" 表示一级标题（如\"一、背景介绍\"、\"二、问题分析\"、\"第一章\"、\"第一部分\"等）\n"
-        "- type 为 \"heading2\" 表示二级标题（如\"（一）\"、\"（二）\"、\"1.1\"、\"2.1\"、\"第一节\"、\"第一小节\"等）\n"
-        "- type 为 \"body\" 表示正文段落\n\n"
-        "**识别规则**：\n"
-        "- 准确识别标题的层级关系，不要混淆一级和二级标题\n"
-        "- 如果文本中有明确的编号体系（如\"一、\"、\"（一）\"、\"1.\"、\"（1）\"），按照编号层级识别\n"
-        "- 一级标题通常是章节标题，二级标题是章节下的小节标题\n"
-        "- 如果格式要求中指定了标题格式，请参考格式要求来识别标题层级\n"
-        "- 不要将正文段落误识别为标题\n"
-        "- 不要改写正文内容，只拆分和标注结构\n\n"
+        "**标题类型**：\n"
+        "- title: 文档主标题（通常只有一个）\n"
+        "- heading1: 一级标题（如\"一、\"、\"二、\"、\"第一章\"、\"1.\"等）\n"
+        "- heading2: 二级标题（如\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等）\n"
+        "- body: 正文段落\n\n"
+        "**识别与标记规则（必须严格遵守）**：\n"
+        "- **重要**：即使没有Markdown标记（`#`），也要识别纯文本格式的标题（\"一、\"、\"（一）\"、\"(一)\"、\"1.1\"等），并做相应标记，确保文档生成时根据格式要求进行处理；\n"
+        "- **编号识别与标记**：\n"
+        "  * heading1: \"一、\"、\"二、\"、\"第一章\"、\"1.\"等开头的独立行，**必须标记为heading1**\n"
+        "  * heading2: \"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等开头的独立行（无论中文括号还是英文括号），**必须标记为heading2**\n"
+        "- **关键规则**：\n"
+        "  * 以\"（一）\"、\"(一)\"、\"1.1\"、\"1）\"等编号开头的行，**必须标记为heading2，绝对不能标记为body**\n"
+        "  * 嵌套编号层级：\"一、\"→heading1，\"（一）\"/(一)→heading2\n"
+        "  * 不要把带编号的标题标记为body\n"
+        "- **识别验证与标记确认**：\n"
+        "  * 识别到标题后，必须立即标记为对应的type（title/heading1/heading2），不能遗漏或错误标记\n"
+        "  * 如果格式要求中指定了标题格式，参考格式要求来识别和标记标题层级\n"
+        "  * 只拆分和标注结构，不改写内容\n\n"
+        "**示例**：\n"
+        "- \"一、事件概况\" → {\"type\": \"heading1\", \"text\": \"一、事件概况\"}\n"
+        "- \"(一)目标定位\" → {\"type\": \"heading2\", \"text\": \"(一)目标定位\"}\n\n"
         "**输出要求**：\n"
-        "- 仅输出 JSON 数组，不要添加多余文字或解释\n"
-        "- 确保 JSON 格式正确，可以被解析\n"
+        "- 仅输出 JSON 数组，不要添加多余文字或解释；\n"
+        "- 确保 JSON 格式正确，可以被解析；\n"
+        "- 每个识别到的标题都必须有正确的type标记，确保文档生成时能根据格式要求进行处理。\n"
         f"{format_guidance}"
         f"【格式要求】:\n{format_requirements[:2000]}\n\n"
         f"【正文内容】:\n{body[:8000]}"
     )
 
-    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1)
+    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
     if not content:
         return []
 
@@ -728,18 +1077,146 @@ def llm_segment_blocks(format_requirements: str, body: str) -> list[dict]:
 
 
 # ======================
+# 文档语言检测与格式要求分类
+# ======================
+
+def detect_document_language(content: str) -> str:
+    """检测文档内容的主要语言（中文/英文）。
+    
+    Args:
+        content: 文档内容文本
+    
+    Returns:
+        "chinese" 或 "english"
+    """
+    if not content or not content.strip():
+        return "english"  # 默认英文
+    
+    # 统计中文字符数量
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', content))
+    # 统计英文字符数量（字母）
+    english_chars = len(re.findall(r'[a-zA-Z]', content))
+    
+    # 如果中文字符占比超过30%，认为是中文文档
+    total_chars = chinese_chars + english_chars
+    if total_chars == 0:
+        return "english"  # 默认英文
+    
+    chinese_ratio = chinese_chars / total_chars
+    return "chinese" if chinese_ratio > 0.3 else "english"
+
+
+def classify_format_requirements(format_text: str) -> dict[str, str]:
+    """将格式要求文本分类为中文格式要求和英文格式要求。
+    
+    Args:
+        format_text: 格式要求文本（可能包含中英文混合）
+    
+    Returns:
+        包含 "chinese" 和 "english" 键的字典，值为对应的格式要求文本
+    """
+    if not format_text or not format_text.strip():
+        return {"chinese": "", "english": ""}
+    
+    prompt = (
+        "下面是一段格式要求文本，可能同时包含中文格式要求和英文格式要求。"
+        "请将其分类为两部分：中文格式要求和英文格式要求。\n\n"
+        "**分类标准**：\n"
+        "- **中文格式要求**：包含中文描述或中文格式术语，如\"1.5倍行距\"、\"宋体小四\"、\"黑体三号\"、\"首行缩进2字符\"、\"段前段后间距\"、\"左对齐\"、\"居中\"等\n"
+        "- **英文格式要求**：包含英文描述或英文格式术语，如\"double spacing\"、\"Times New Roman\"、\"1-inch margins\"、\"APA 7th edition\"、\"centered\"、\"bold\"、\"left-aligned\"、\"first-line indent\"等\n"
+        "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），按照标记分类\n"
+        "- 如果格式要求没有明确指定语言，根据格式描述的语种判断\n"
+        "- 通用格式要素（如\"A4\"、\"12pt\"、\"2.5cm\"等）如果出现在中文描述中，归入中文格式要求；如果出现在英文描述中，归入英文格式要求\n\n"
+        "**输出格式**（JSON对象）：\n"
+        "{\n"
+        '  "chinese": "中文格式要求文本（如果没有则返回空字符串）",\n'
+        '  "english": "英文格式要求文本（如果没有则返回空字符串）"\n'
+        "}\n\n"
+        "**输出要求**：\n"
+        "- 只输出JSON，不要添加解释\n"
+        "- 如果只有一种语言的格式要求，另一种语言的值为空字符串\n"
+        "- 保持原文表述，不要翻译\n\n"
+        f"格式要求文本：\n{format_text[:4000]}"
+    )
+    
+    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
+    if not content:
+        # 如果LLM调用失败，尝试简单的关键词检测
+        format_lower = format_text.lower()
+        chinese_keywords = ["宋体", "黑体", "gb/t", "国标", "中文", "小四", "四号", "三号", "倍行距", "字符"]
+        english_keywords = ["times new roman", "arial", "calibri", "double spacing", "single spacing", 
+                           "apa", "mla", "chicago", "inch", "first-line indent"]
+        
+        has_chinese = any(kw in format_lower for kw in chinese_keywords)
+        has_english = any(kw in format_lower for kw in english_keywords)
+        
+        if has_chinese and has_english:
+            # 如果同时包含中英文关键词，返回原文本（让后续逻辑处理）
+            return {"chinese": format_text, "english": format_text}
+        elif has_chinese:
+            return {"chinese": format_text, "english": ""}
+        elif has_english:
+            return {"chinese": "", "english": format_text}
+        else:
+            # 无法判断，默认全部归为中文
+            return {"chinese": format_text, "english": ""}
+    
+    # 提取JSON
+    data = _extract_json_from_text(content, bracket_type="{")
+    if not isinstance(data, dict):
+        # 解析失败，默认全部归为中文
+        return {"chinese": format_text, "english": ""}
+    
+    chinese_format = str(data.get("chinese", "")).strip()
+    english_format = str(data.get("english", "")).strip()
+    
+    return {"chinese": chinese_format, "english": english_format}
+
+
+# ======================
 # 格式要求解析
 # ======================
+
+def _detect_format_template(format_text: str) -> str:
+    """检测格式文本中是否包含格式库关键词。
+    
+    Args:
+        format_text: 格式要求文本
+    
+    Returns:
+        格式库名称，如果未检测到则返回空字符串
+    """
+    if not format_text:
+        return ""
+    
+    format_lower = format_text.lower()
+    
+    # 检测格式库关键词
+    template_keywords = {
+        "APA 7th Edition": ["apa", "apa 7th", "apa 7", "american psychological association"],
+        "MLA 9th Edition": ["mla", "mla 9th", "mla 9", "modern language association"],
+        "Chicago 17th Edition": ["chicago", "chicago 17th", "chicago 17", "turabian"],
+        "IEEE": ["ieee"],
+        "GB/T 7714-2015（中文）": ["gb/t 7714", "gb/t7714", "gb/t 7714-2015", "国标7714", "国标 7714"]
+    }
+    
+    for template_name, keywords in template_keywords.items():
+        if any(kw in format_lower for kw in keywords):
+            return template_name
+    
+    return ""
+
 
 def parse_format_requirements(format_text: str) -> dict[str, dict[str, object]]:
     """从格式要求文本中解析格式参数，返回格式配置字典。
     
-    使用LLM从格式要求文本中提取格式参数，包括：
+    如果检测到格式库关键词，优先使用格式库配置。
+    否则使用LLM从格式要求文本中提取格式参数，包括：
     - 纸张大小（A4等）
     - 页边距（上、下、左、右）
     - 字体和字号（标题、一级标题、二级标题、正文）
     - 行距
-    - 首行缩进
+    - 首行缩进（会根据文档类型自动调整）
     
     Args:
         format_text: 格式要求文本
@@ -749,6 +1226,15 @@ def parse_format_requirements(format_text: str) -> dict[str, dict[str, object]]:
     """
     if not format_text or not format_text.strip():
         return {}
+    
+    # 关键修复：优先检测格式库
+    template_name = _detect_format_template(format_text)
+    if template_name:
+        # 如果检测到格式库，直接使用格式库配置（通过LLM解析格式库文本）
+        template_text = FORMAT_TEMPLATES.get(template_name, "")
+        if template_text:
+            # 使用格式库文本进行解析
+            format_text = template_text
     
     prompt = (
         "下面是一段格式要求文本。请从中提取格式参数，并以JSON格式输出。\n\n"
@@ -760,7 +1246,12 @@ def parse_format_requirements(format_text: str) -> dict[str, dict[str, object]]:
         "- 二级标题字体和字号（如\"黑体四号\"、\"14pt\"等）\n"
         "- 正文字体和字号（如\"宋体小四\"、\"12pt\"等）\n"
         "- 行距（如\"1.5倍\"、\"1.25倍\"、\"固定值22磅\"等）\n"
-        "- 首行缩进（如\"2字符\"、\"2个字符\"等）\n\n"
+        "- 首行缩进（如\"2字符\"、\"2个字符\"、\"0.5英寸\"、\"0\"等）\n\n"
+        "**首行缩进规则**（重要）：\n"
+        "- 如果格式要求中明确提到\"首行缩进\"、\"first-line indent\"等，使用指定的值\n"
+        "- 如果格式要求中提到英文格式（如\"Times New Roman\"、\"English\"、\"APA\"、\"MLA\"等），且未明确指定首行缩进，使用 4.5（对应0.5英寸）\n"
+        "- 如果格式要求中提到中文格式（如\"宋体\"、\"黑体\"、\"GB/T\"等），且未明确指定首行缩进，使用 2（2字符）\n"
+        "- 如果格式要求中未明确指定，且无法判断文档类型，不要包含 first_line_chars 字段（让后续逻辑根据字体判断）\n\n"
         "**输出格式**（JSON对象）：\n"
         "{\n"
         '  "page": {\n'
@@ -798,7 +1289,7 @@ def parse_format_requirements(format_text: str) -> dict[str, dict[str, object]]:
         f"格式要求文本：\n{format_text[:3000]}"
     )
     
-    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1)
+    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
     if not content:
         return {}
     
@@ -875,12 +1366,13 @@ def parse_format_requirements(format_text: str) -> dict[str, dict[str, object]]:
     return parsed_config
 
 
-def _merge_config(default_config: dict, parsed_config: dict) -> dict:
+def _merge_config(default_config: dict, parsed_config: dict, format_text: str = "") -> dict:
     """合并默认配置和解析的格式配置。
     
     Args:
         default_config: 默认配置
         parsed_config: 从格式要求中解析的配置
+        format_text: 格式要求文本（可选，用于智能检测文档类型）
     
     Returns:
         合并后的配置
@@ -894,23 +1386,250 @@ def _merge_config(default_config: dict, parsed_config: dict) -> dict:
         merged["page"] = default_config.get("page", {}).copy()
     
     # 合并样式配置
+    # 关键修复：对于 body，先排除 first_line_chars，单独处理
     for style_type in ["title", "heading1", "heading2", "body"]:
         if style_type in parsed_config:
-            merged[style_type] = {
-                **default_config.get(style_type, {}),
-                **parsed_config[style_type]
-            }
+            if style_type == "body":
+                # body 特殊处理：先合并其他字段，排除 first_line_chars
+                merged[style_type] = default_config.get(style_type, {}).copy()
+                parsed_style = parsed_config[style_type]
+                for key, value in parsed_style.items():
+                    if key != "first_line_chars":  # first_line_chars 单独处理
+                        merged[style_type][key] = value
+            else:
+                # 其他样式类型正常合并
+                merged[style_type] = {
+                    **default_config.get(style_type, {}),
+                    **parsed_config[style_type]
+                }
         else:
-            merged[style_type] = default_config.get(style_type, {}).copy()
+            # 关键修复：对于 body，即使 parsed_config 中没有，也要排除 first_line_chars
+            if style_type == "body":
+                merged[style_type] = default_config.get(style_type, {}).copy()
+                # 立即删除 first_line_chars，避免污染
+                if "first_line_chars" in merged[style_type]:
+                    del merged[style_type]["first_line_chars"]
+            else:
+                merged[style_type] = default_config.get(style_type, {}).copy()
     
+    # 智能处理正文首行缩进
+    # 关键修复：从合并后的配置中获取，但 first_line_chars 需要单独处理
+    body_cfg = merged.get("body", {}) or {}
+    
+    # 重要：确保 body_cfg 中没有从默认配置继承的 first_line_chars
+    # 如果解析配置中没有明确指定，删除它
+    parsed_body = parsed_config.get("body", {})
+    if "first_line_chars" in body_cfg:
+        if not (isinstance(parsed_body, dict) and "first_line_chars" in parsed_body):
+            del body_cfg["first_line_chars"]
+    
+    # 直接检查解析配置中是否明确指定了首行缩进
+    # 注意：这里检查的是 parsed_config，而不是合并后的 merged
+    parsed_body = parsed_config.get("body", {})
+    parsed_indent = None
+    if isinstance(parsed_body, dict) and "first_line_chars" in parsed_body:
+        try:
+            parsed_indent = float(parsed_body["first_line_chars"])
+        except (TypeError, ValueError):
+            pass
+    
+    # 如果解析配置中明确指定了首行缩进，需要验证是否合理
+    if parsed_indent is not None:
+        # 如果值是2或0（可能是LLM返回的默认值），需要验证是否适合当前文档
+        if (parsed_indent == 2.0 or parsed_indent == 0) and format_text:
+            # 检查是否是英文文档
+            format_lower = format_text.lower()
+            font_cn = str(body_cfg.get("font_cn", "")).lower()
+            is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+            
+            # 检测英文关键词（包含学术格式和商业文档关键词，统一处理为英文文档）
+            english_keywords = ["times new roman", "arial", "calibri", "english", 
+                               "double spacing", "single spacing", "inch", "pt", "point",
+                               "apa", "mla", "chicago", "ieee", "harvard", "vancouver",
+                               "business", "report", "proposal", "memo", "letter"]
+            has_english = any(kw in format_lower for kw in english_keywords)
+            
+            # 关键修复：优先根据字体判断，而不是仅依赖关键词检测
+            if not is_chinese_font and font_cn:
+                # 非中文字体（且字体已设置）：统一使用4.5字符（0.5英寸）
+                body_cfg["first_line_chars"] = 4.5
+            elif is_chinese_font:
+                # 中文字体：使用2字符
+                body_cfg["first_line_chars"] = 2.0
+            elif has_english and not is_chinese_font:
+                # 如果检测到英文关键词且不是中文字体，统一使用4.5字符（0.5英寸）
+                body_cfg["first_line_chars"] = 4.5
+            else:
+                # 无法确定：根据字体判断（优先字体）
+                if font_cn and font_cn not in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]:
+                    # 非中文字体：统一使用4.5字符
+                    body_cfg["first_line_chars"] = 4.5
+                else:
+                    # 中文字体或未设置：使用解析值
+                    body_cfg["first_line_chars"] = parsed_indent
+        else:
+            # 其他值（4.5等）直接使用
+            body_cfg["first_line_chars"] = parsed_indent
+        
+        merged["body"] = body_cfg
+        return merged
+    
+    # 如果解析配置中没有指定首行缩进，根据格式要求文本智能检测
+    if format_text:
+        format_lower = format_text.lower()
+        
+        # 关键修复：优先根据字体判断
+        font_cn = str(body_cfg.get("font_cn", "")).lower()
+        is_chinese_font = font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]
+        
+        # 检测中文格式关键词
+        chinese_keywords = ["宋体", "黑体", "gb/t", "国标", "中文", "小四", "四号", "三号"]
+        
+        # 检测英文格式关键词（用于判断是否为英文文档）
+        # 包含学术格式和商业文档关键词，统一处理为英文文档
+        english_keywords = ["times new roman", "arial", "calibri", "english", 
+                           "double spacing", "single spacing", "inch", "pt", "point",
+                           "apa", "mla", "chicago", "ieee", "harvard", "vancouver",
+                           "business", "report", "proposal", "memo", "letter"]
+        
+        has_chinese = any(kw in format_lower for kw in chinese_keywords)
+        has_english = any(kw in format_lower for kw in english_keywords)
+        
+        if is_chinese_font:
+            # 中文字体：2字符缩进（优先字体判断）
+            body_cfg["first_line_chars"] = 2.0
+        elif not is_chinese_font and font_cn:
+            # 非中文字体（且字体已设置）：统一使用4.5字符（0.5英寸）
+            body_cfg["first_line_chars"] = 4.5
+        elif has_chinese:
+            # 中文格式关键词：2字符缩进
+            body_cfg["first_line_chars"] = 2.0
+        elif has_english and not has_chinese:
+            # 英文文档（统一）：4.5字符缩进（0.5英寸）
+            body_cfg["first_line_chars"] = 4.5
+        else:
+            # 无法确定：根据字体判断
+            if font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]:
+                # 中文字体：2字符缩进
+                body_cfg["first_line_chars"] = 2.0
+            else:
+                # 英文字体：统一使用4.5字符（0.5英寸）
+                body_cfg["first_line_chars"] = 4.5
+    else:
+        # 没有格式要求文本：根据字体判断
+        font_cn = str(body_cfg.get("font_cn", "")).lower()
+        if font_cn in ["宋体", "黑体", "微软雅黑", "仿宋", "楷体"]:
+            # 中文字体：2字符缩进
+            body_cfg["first_line_chars"] = 2.0
+        else:
+            # 英文字体：统一使用4.5字符（0.5英寸）
+            body_cfg["first_line_chars"] = 4.5
+    
+    # 关键修复：确保 body_cfg 中总是有 first_line_chars 值（包括0）
+    # 这样即使配置传递有问题，也不会回退到默认值2
+    merged["body"] = body_cfg
     return merged
+
+
+# ======================
+# 预览和格式调整
+# ======================
+
+def _generate_preview_info(blocks: list[dict], config: dict) -> dict:
+    """生成文档预览信息，用于用户确认。
+    
+    Args:
+        blocks: 文档块列表
+        config: 格式配置
+    
+    Returns:
+        包含文档结构摘要和格式配置的字典
+    """
+    title_count = sum(1 for b in blocks if b.get("type") == "title")
+    heading1_count = sum(1 for b in blocks if b.get("type") == "heading1")
+    heading2_count = sum(1 for b in blocks if b.get("type") == "heading2")
+    body_count = sum(1 for b in blocks if b.get("type") == "body")
+    
+    # 提取前几个标题作为预览
+    preview_titles = []
+    for b in blocks[:10]:  # 只显示前10个块
+        if b.get("type") in {"title", "heading1", "heading2"}:
+            text = b.get("text", "")
+            preview_titles.append({
+                "type": b.get("type"),
+                "text": text[:50] + "..." if len(text) > 50 else text
+            })
+    
+    return {
+        "structure": {
+            "title_count": title_count,
+            "heading1_count": heading1_count,
+            "heading2_count": heading2_count,
+            "body_count": body_count,
+            "preview_titles": preview_titles,
+        },
+        "format": {
+            "page": config.get("page", {}),
+            "title": config.get("title", {}),
+            "heading1": config.get("heading1", {}),
+            "heading2": config.get("heading2", {}),
+            "body": config.get("body", {}),
+        }
+    }
+
+
+def _apply_format_adjustment(format_requirements: str, adjustment_request: str, history: list) -> str:
+    """根据用户反馈调整格式要求。
+    
+    Args:
+        format_requirements: 原始格式要求文本
+        adjustment_request: 用户的调整请求（如"标题字号太小，改成18pt"）
+        history: 之前的对话历史
+    
+    Returns:
+        调整后的格式要求文本
+    """
+    history_text = ""
+    if history:
+        recent_history = history[-3:]  # 只保留最近3轮
+        history_text = "\n".join([
+            f"用户: {h.get('user', '')}\nAI: {h.get('ai', '')}" 
+            for h in recent_history if isinstance(h, dict)
+        ])
+    
+    prompt = (
+        "你是一名文档格式调整助手。用户提供了原始格式要求，并提出了调整需求。"
+        "请根据用户的需求，生成更新后的格式要求文本。\n\n"
+        "**原始格式要求**：\n"
+        f"{format_requirements}\n\n"
+        "**用户调整需求**：\n"
+        f"{adjustment_request}\n\n"
+    )
+    
+    if history_text:
+        prompt += (
+            "**对话历史**（最近3轮）：\n"
+            f"{history_text}\n\n"
+        )
+    
+    prompt += (
+        "**任务**：\n"
+        "- 理解用户的调整需求\n"
+        "- 在原始格式要求的基础上进行修改\n"
+        "- 只输出更新后的格式要求文本，不要添加解释\n"
+        "- 保持格式要求的完整性和准确性\n"
+        "- 如果用户需求不明确，保持原格式要求不变"
+    )
+    
+    adjusted = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.2, timeout=30)
+    return adjusted.strip() if adjusted else format_requirements
 
 
 # ======================
 # 文档生成主流程
 # ======================
 
-def _generate_document(format_requirements: str, markdown_content: str) -> bytes | None:
+def _generate_document(format_requirements: str, markdown_content: str) -> tuple[bytes | None, dict | None]:
     """生成Word文档的主流程。
     
     Args:
@@ -918,37 +1637,174 @@ def _generate_document(format_requirements: str, markdown_content: str) -> bytes
         markdown_content: Markdown内容文本
     
     Returns:
-        生成的文档字节流，如果生成失败则返回None
+        (生成的文档字节流, 预览信息) 元组，如果生成失败则返回 (None, None)
     """
     try:
-        # 优先：如果内容中没有任何 # 标记，直接用 LLM 划分 title / heading1 / heading2 / body
-        if "#" not in markdown_content:
-            blocks = llm_segment_blocks(format_requirements, markdown_content)
-            if not blocks:
-                # 回退到旧逻辑：先转 Markdown，再解析
-                content_to_parse = llm_enhance_markdown(markdown_content, format_requirements)
-                blocks = parse_markdown(content_to_parse)
+        import time
+        
+        blocks: list[dict]
+        
+        # 检查是否有Markdown标记（#、##、###）或中文编号格式标题
+        # 这样可以确保上传的Markdown文件和直接粘贴的文本都能正确识别标题
+        import re
+        
+        has_markdown_headers = any(
+            line.strip().startswith(('#', '##', '###'))
+            for line in markdown_content.split('\n')
+            if line.strip()
+        )
+        
+        # 检查是否有中文编号格式的标题
+        has_chinese_headers = any(
+            re.match(r'^[一二三四五六七八九十]+[、.]', line.strip()) or
+            re.match(r'^第[一二三四五六七八九十]+[章节部分]', line.strip()) or
+            re.match(r'^\d+[、.]', line.strip()) or
+            re.match(r'^[（(][一二三四五六七八九十]+[）)]', line.strip()) or
+            re.match(r'^\d+\.\d+', line.strip()) or
+            re.match(r'^\d+[）)]', line.strip())
+            for line in markdown_content.split('\n')
+            if line.strip()
+        )
+        
+        if has_markdown_headers or has_chinese_headers:
+            # 如果有Markdown标记或中文编号格式，使用增强的parse_markdown解析
+            # parse_markdown现在可以同时识别两种格式
+            st.info("正在识别文档结构...")
+            start_time = time.time()
+            
+            parsed_blocks = parse_markdown(markdown_content)
+            # 转换为统一格式
+            blocks = [
+                {
+                    "type": block.get("type", "body"),
+                    "text": block.get("text", "").strip()
+                }
+                for block in parsed_blocks
+                if block.get("text", "").strip()
+            ]
+            
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 0.1:
+                st.write(f"⏱️ 结构识别耗时: {elapsed_time:.2f}秒")
         else:
-            # 已有 Markdown 标记，按原规则解析
-            blocks = parse_markdown(markdown_content)
+            # 如果既没有Markdown标记也没有中文编号格式，使用LLM识别
+            doc_length = len(markdown_content)
+            if doc_length > 8000:
+                st.info(f"文档较长（{doc_length}字符），正在分块处理，请稍候...")
+            else:
+                st.info("正在识别文档结构...")
+            
+            start_time = time.time()
+            blocks = llm_segment_blocks(format_requirements, markdown_content)
+            elapsed_time = time.time() - start_time
+            st.write(f"⏱️ 结构识别耗时: {elapsed_time:.1f}秒")
+            
+            # 如果LLM识别失败，回退到parse_markdown（可能文本中有未检测到的格式）
+            if not blocks:
+                parsed_blocks = parse_markdown(markdown_content)
+                blocks = [
+                    {
+                        "type": block.get("type", "body"),
+                        "text": block.get("text", "").strip()
+                    }
+                    for block in parsed_blocks
+                    if block.get("text", "").strip()
+                ]
+        
+        # 调试输出：显示识别结果统计
+        if blocks:
+            block_types = {}
+            for b in blocks:
+                b_type = b.get("type", "unknown")
+                block_types[b_type] = block_types.get(b_type, 0) + 1
+            st.write(f"🔍 识别结果统计: {block_types}")
+
+        # 对 blocks 做一次统一规范与结构修正（保证至少有一个 title）
+        def _normalize_blocks(raw_blocks: list[dict]) -> list[dict]:
+            normalized: list[dict] = []
+            for item in raw_blocks:
+                if not isinstance(item, dict):
+                    continue
+                block_type = str(item.get("type", "body"))
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                if block_type not in {"title", "heading1", "heading2", "body"}:
+                    block_type = "body"
+                normalized.append({"type": block_type, "text": text})
+
+            # 如果没有显式 title，则将第一个 heading1/heading2 提升为 title
+            has_title = any(b.get("type") == "title" for b in normalized)
+            if not has_title:
+                for b in normalized:
+                    if b.get("type") in {"heading1", "heading2"}:
+                        b["type"] = "title"
+                        break
+            return normalized
+
+        blocks = _normalize_blocks(blocks)
 
         # 获取默认配置
         default_config = get_default_config()
         
-        # 如果格式要求文本存在，解析并合并配置
+        # 关键修复：检测文档语言并选择对应的格式要求
+        doc_language = detect_document_language(markdown_content)
+        
+        # 分类格式要求
+        classified_formats = {"chinese": "", "english": ""}
         if format_requirements and format_requirements.strip():
-            parsed_config = parse_format_requirements(format_requirements)
+            classified_formats = classify_format_requirements(format_requirements)
+        
+        # 根据文档语言选择格式要求
+        selected_format = ""
+        if doc_language == "chinese":
+            # 中文文档：优先使用中文格式要求，如果没有则使用英文格式要求
+            selected_format = classified_formats["chinese"] or classified_formats["english"]
+        else:
+            # 英文文档：优先使用英文格式要求
+            if classified_formats["english"]:
+                selected_format = classified_formats["english"]
+            elif classified_formats["chinese"]:
+                # 如果只有中文格式要求，使用默认格式（最通用的格式）
+                st.info("⚠️ 检测到英文文档，但格式要求只有中文。将使用默认英文格式（Times New Roman 12pt, 0.5英寸首行缩进）。")
+                selected_format = ""  # 使用默认配置
+            else:
+                selected_format = ""
+        
+        # 如果格式要求文本存在，解析并合并配置
+        if selected_format and selected_format.strip():
+            parsed_config = parse_format_requirements(selected_format)
             if parsed_config:
-                config = _merge_config(default_config, parsed_config)
+                config = _merge_config(default_config, parsed_config, selected_format)
+                # 调试：显示最终配置的首行缩进值
+                body_indent = config.get("body", {}).get("first_line_chars", "未设置")
+                body_font = config.get("body", {}).get("font_cn", "未设置")
+                st.write(f"🔧 调试信息 - 文档语言: {doc_language}, 首行缩进: {body_indent}, 字体: {body_font}")
             else:
                 config = default_config
         else:
-            config = default_config
+            # 使用默认配置，但对于英文文档，确保使用正确的默认格式
+            if doc_language == "english":
+                # 设置默认英文格式
+                config = default_config.copy()
+                body_cfg = config.get("body", {}).copy()
+                body_cfg["font_cn"] = "Times New Roman"  # 英文字体
+                body_cfg["font_en"] = "Times New Roman"
+                body_cfg["size_pt"] = 12
+                body_cfg["first_line_chars"] = 4.5  # 0.5英寸
+                config["body"] = body_cfg
+                st.write(f"🔧 调试信息 - 文档语言: {doc_language}, 使用默认英文格式")
+            else:
+                config = default_config
+        
+        # 生成预览信息
+        preview_info = _generate_preview_info(blocks, config)
         
         doc = generate_docx(blocks, config)
-        return doc_to_bytes(doc)
+        doc_bytes = doc_to_bytes(doc)
+        return doc_bytes, preview_info
     except Exception:
-        return None
+        return None, None
 
 
 # Streamlit 主应用入口文件
@@ -968,18 +1824,18 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
 
-    # 自定义全局样式（Figma Dark 风格）
+    # 自定义全局样式（Minimalist Stepped Flow）
     st.markdown(
         """
         <style>
-        /* UI build: 2025-12-17-02 */
+        /* UI build: Minimalist Stepped Flow - 2025-01-XX */
         :root {
-          --bg: #111217;
-          --card: #1A1B22;
-          --panel: #20212B;
-          --border: #2E2F3A;
+          --bg: #0D0D0D;
+          --card: #1A1B1E;
+          --panel: #1A1B1E;
+          --border: #2D2E32;
           --text: #EAEAEA;
-          --muted: #A8A9B3;
+          --muted: rgba(234, 234, 234, 0.6);
           --accent: #7C3AED;
           --icon: #007AFF;
         }
@@ -991,17 +1847,22 @@ def main() -> None:
         }
 
         html, body, [class*="css"] {
-          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+          font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
                        "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
           color: var(--text);
           background: var(--bg);
+          background-image: radial-gradient(circle at 20% 50%, rgba(124, 58, 237, 0.05) 0%, transparent 50%),
+                            radial-gradient(circle at 80% 80%, rgba(124, 58, 237, 0.03) 0%, transparent 50%);
         }
 
         .main .block-container {
           animation: fadeIn 0.45s ease;
-          max-width: 1280px;
+          max-width: 960px;
+          margin: 0 auto;
           padding-top: 0.9rem;
           padding-bottom: 1.4rem;
+          padding-right: 0;
+          padding-left: 0;
         }
 
         /* 侧边栏（默认折叠） */
@@ -1037,7 +1898,8 @@ def main() -> None:
         /* 组件 label */
         label, [data-testid="stWidgetLabel"] > div {
           color: var(--muted) !important;
-          font-weight: 600 !important;
+          font-weight: 500 !important;
+          font-family: "Inter", system-ui, sans-serif !important;
         }
 
         /* 上传区（Dropzone） */
@@ -1046,11 +1908,12 @@ def main() -> None:
           background: var(--panel);
           border-radius: 12px;
           padding: 0.9rem;
-          transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+          transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
         }
         [data-testid="stFileUploaderDropzone"]:hover {
           border-color: var(--accent);
-          box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.16);
+          box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.3),
+                      0 0 20px rgba(124, 58, 237, 0.5);
           transform: translateY(-1px);
         }
         [data-testid="stFileUploaderDropzone"] * {
@@ -1210,14 +2073,25 @@ def main() -> None:
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 12px 4px 8px 4px;
-          margin-bottom: 4px;
+          padding: 16px 4px 12px 4px;
+          margin-bottom: 6px;
         }
 
         .app-hero-left {
           display: flex;
           align-items: center;
-          gap: 16px;
+          gap: 20px;
+        }
+
+        .app-hero-logo {
+          width: 88px !important;
+          height: 88px !important;
+          min-width: 88px !important;
+          min-height: 88px !important;
+          border-radius: 16px;
+          object-fit: contain !important;
+          background: #020617;
+          flex-shrink: 0;
         }
 
         .app-hero-title {
@@ -1268,14 +2142,172 @@ def main() -> None:
 
         /* 主区域卡片 */
         .app-card {
-          background: var(--card);
-          border-radius: 16px;
-          border: 1px solid var(--border);
-          padding: 18px 18px 16px 18px;
-          box-shadow: 0 18px 40px rgba(15, 23, 42, 0.65);
+          /* 隐藏视觉样式 */
+          background: transparent;
+          border: none;
+          border-radius: 0;
+          box-shadow: none;
+          /* 保留布局属性 */
           display: flex;
           flex-direction: column;
           gap: 12px;
+          /* 保留内边距以维持间距 */
+          padding: 0;
+        }
+
+        /* 步骤容器 */
+        .step-container {
+          animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+          from {
+            opacity: 0;
+            transform: translateX(20px);
+          }
+          to {
+            opacity: 1;
+            transform: translateX(0);
+          }
+        }
+
+        /* 步骤指示器 */
+        .step-indicator {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 12px;
+          padding: 8px 16px;
+        }
+
+        .step-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 14px;
+          color: var(--muted);
+          transition: color 0.2s ease;
+        }
+
+        .step-item.active {
+          color: var(--text);
+          font-weight: 600;
+        }
+
+        .step-item-number {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: var(--border);
+          color: var(--muted);
+          font-size: 12px;
+          font-weight: 600;
+          transition: all 0.2s ease;
+        }
+
+        .step-item.active .step-item-number {
+          background: var(--accent);
+          color: white;
+        }
+
+        .step-connector {
+          width: 40px;
+          height: 1px;
+          background: var(--border);
+          margin: 0 4px;
+        }
+
+        /* Header 三列布局 */
+        .app-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 16px 4px 12px 4px;
+          margin-bottom: 6px;
+        }
+
+        .header-left {
+          display: flex;
+          align-items: center;
+          flex: 0 0 auto;
+        }
+
+        .header-logo-text {
+          font-size: 24px;
+          font-weight: 700;
+          color: var(--text);
+          letter-spacing: 0.02em;
+          font-family: "Inter", system-ui, sans-serif;
+          margin: 0;
+          padding: 0;
+        }
+
+        .header-center {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex: 1 1 auto;
+        }
+
+        .header-right {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex: 0 0 auto;
+        }
+
+        .header-badge {
+          padding: 4px 10px;
+          border-radius: 999px;
+          border: 1px solid var(--border);
+          font-size: 11px;
+          color: var(--muted);
+        }
+
+        .deploy-button {
+          padding: 6px 14px;
+          border-radius: 8px;
+          border: 1px solid var(--border);
+          background: var(--card);
+          color: var(--text);
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+
+        .deploy-button:hover {
+          background: var(--panel);
+          border-color: var(--accent);
+        }
+
+        .header-search-icon {
+          width: 36px;
+          height: 36px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 8px;
+          border: 1px solid var(--border);
+          background: var(--card);
+          cursor: pointer;
+          transition: all 0.2s ease;
+          color: var(--text);
+          font-size: 16px;
+        }
+
+        .header-search-icon:hover {
+          background: var(--panel);
+          border-color: var(--accent);
+        }
+
+        /* 步骤导航按钮 */
+        .step-nav-button {
+          width: 100%;
+          margin-top: 16px;
         }
 
         /* 底部操作区 */
@@ -1290,12 +2322,13 @@ def main() -> None:
         .app-footer-inner {
           display: inline-flex;
           align-items: center;
-          gap: 10px;
-          padding: 8px 16px;
-          border-radius: 999px;
-          background: rgba(15, 23, 42, 0.9);
-          border: 1px solid rgba(148, 163, 184, 0.35);
-          box-shadow: 0 18px 40px rgba(15, 23, 42, 0.85);
+          gap: 8px;
+          /* 隐藏视觉样式 */
+          padding: 0;
+          border-radius: 0;
+          background: transparent;
+          border: none;
+          box-shadow: none;
         }
 
         .app-footer-status {
@@ -1303,8 +2336,18 @@ def main() -> None:
           color: var(--muted);
         }
 
+        /* 按钮容器：让按钮紧挨着 */
+        .app-footer-buttons {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          margin-left: 8px;
+        }
+
         .app-footer [data-testid="stButton"] button,
-        .app-footer [data-testid="stDownloadButton"] button {
+        .app-footer [data-testid="stDownloadButton"] button,
+        .app-footer-buttons [data-testid="stButton"] button,
+        .app-footer-buttons [data-testid="stDownloadButton"] button {
           width: 44px !important;
           height: 44px !important;
           min-width: 44px !important;
@@ -1325,13 +2368,16 @@ def main() -> None:
         }
 
         .app-footer [data-testid="stButton"] button:hover,
-        .app-footer [data-testid="stDownloadButton"] button:hover {
+        .app-footer [data-testid="stDownloadButton"] button:hover,
+        .app-footer-buttons [data-testid="stButton"] button:hover,
+        .app-footer-buttons [data-testid="stDownloadButton"] button:hover {
           transform-origin: center;
           transform: translateY(-1px) scale(1.02);
           box-shadow: 0 18px 40px rgba(88, 80, 236, 0.65) !important;
         }
 
-        .app-footer [data-testid="stDownloadButton"] button:disabled {
+        .app-footer [data-testid="stDownloadButton"] button:disabled,
+        .app-footer-buttons [data-testid="stDownloadButton"] button:disabled {
           filter: grayscale(0.4) brightness(0.7);
           opacity: 0.6;
           cursor: not-allowed !important;
@@ -1372,6 +2418,18 @@ def main() -> None:
         st.session_state["show_tutorial"] = True
     if "doc_bytes" not in st.session_state:
         st.session_state["doc_bytes"] = None
+    if "current_step" not in st.session_state:
+        st.session_state["current_step"] = 1
+    if "last_format_file_id" not in st.session_state:
+        st.session_state["last_format_file_id"] = ""
+    if "last_selected_format" not in st.session_state:
+        st.session_state["last_selected_format"] = ""
+    if "doc_preview_mode" not in st.session_state:
+        st.session_state["doc_preview_mode"] = False
+    if "doc_preview_info" not in st.session_state:
+        st.session_state["doc_preview_info"] = None
+    if "format_adjustment_history" not in st.session_state:
+        st.session_state["format_adjustment_history"] = []
 
     # 首屏 Tutorial（简化版：居中卡片，不再真正虚化背景，保证交互稳定）
     if st.session_state["show_tutorial"]:
@@ -1416,26 +2474,36 @@ def main() -> None:
         # 只显示教程卡片，其余界面不渲染
         st.stop()
 
-    # 顶部 Hero（只在 tutorial 关闭后显示）- 带 Logo
-    logo_path = Path(__file__).parent / "Logo.png"
-    if logo_path.exists():
-        logo_b64 = base64.b64encode(logo_path.read_bytes()).decode("utf-8")
-        logo_src = f"data:image/png;base64,{logo_b64}"
-    else:
-        logo_src = ""
+    # 顶部 Header（只在 tutorial 关闭后显示）- 三列布局
+    current_step = st.session_state.get("current_step", 1)
 
     st.markdown(
         f"""
-        <div class="app-hero">
-          <div class="app-hero-left">
-            {'<img src="' + logo_src + '" alt="Doc logo" style="width:40px;height:40px;border-radius:12px;object-fit:cover;background:#020617;" />' if logo_src else ''}
-            <div class="app-hero-title">
-              <h1>Doc. – AI Format Assistant</h1>
-              <p class="app-hero-subtitle">{t('subtitle')}</p>
+        <div class="app-header">
+          <div class="header-left">
+            <div class="header-logo-text">DOC.</div>
+            </div>
+          <div class="header-center">
+            <div class="step-indicator">
+              <div class="step-item {'active' if current_step == 1 else ''}">
+                <div class="step-item-number">1</div>
+                <span>Format Settings</span>
+          </div>
+              <div class="step-connector"></div>
+              <div class="step-item {'active' if current_step == 2 else ''}">
+                <div class="step-item-number">2</div>
+                <span>Content Input</span>
+              </div>
             </div>
           </div>
-          <div class="app-hero-badge">
-            for MBA · academic writing
+          <div class="header-right">
+            <div class="header-search-icon" onclick="alert('Search functionality coming soon')" title="Search">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M7 12C9.76142 12 12 9.76142 12 7C12 4.23858 9.76142 2 7 2C4.23858 2 2 4.23858 2 7C2 9.76142 4.23858 12 7 12Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <button class="deploy-button" onclick="alert('Deploy functionality coming soon')">Deploy</button>
           </div>
         </div>
         <div class="hero-divider"></div>
@@ -1443,11 +2511,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    # 左右两列：左“格式要求”，右“内容”
-    col_left, col_right = st.columns([5, 7], gap="large")
-
-    # ===== 左列：格式要求 =====
-    with col_left:
+    # 单列居中布局，根据步骤显示内容
+    st.markdown('<div class="step-container">', unsafe_allow_html=True)
+    
+    current_step = st.session_state.get("current_step", 1)
+    
+    if current_step == 1:
+        # Step 1: Format Requirements
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
         st.markdown(
             f"""
@@ -1468,33 +2538,78 @@ def main() -> None:
 
         if format_file is not None:
             suffix = Path(format_file.name).suffix.lower()
+            # 计算当前文件的简单 ID（名称 + 大小），用于避免重复识别
+            file_id = f"{format_file.name}_{getattr(format_file, 'size', 0)}"
+            is_new_file = file_id != st.session_state.get("last_format_file_id", "")
             
             # 如果是图片文件，显示预览
             if suffix in {".png", ".jpg", ".jpeg"}:
                 image_bytes = format_file.getvalue()
                 st.image(image_bytes, caption=t("image_preview_caption"), use_column_width=True)
             
-            # 统一使用AI识别格式要求（所有文件类型）
-            with st.spinner(t("spinner_recognizing_image")):
-                recognized = extract_format_requirements_unified(format_file)
-            
-            if recognized:
-                st.session_state["format_requirements"] = recognized
-                st.success(t("success_format_recognized"))
-            else:
-                st.warning(t("warn_image_not_recognized"))
+            if is_new_file:
+                # 仅在新文件时调用 AI 识别，避免重复耗时操作
+                with st.spinner(t("spinner_recognizing_image")):
+                    recognized = extract_format_requirements_unified(format_file)
+                
+                st.session_state["last_format_file_id"] = file_id
+                if recognized:
+                    st.session_state["format_requirements"] = recognized
+                    st.success(t("success_format_recognized"))
+                else:
+                    st.warning(t("warn_image_not_recognized"))
+                    # 识别失败时，显示常用格式库选择器
+                    st.info("💡 未识别到格式要求，您可以从常用格式库中选择：")
+                    selected_format = st.selectbox(
+                        "选择常用格式",
+                        options=[""] + list(FORMAT_TEMPLATES.keys()),
+                        key="format_template_selector",
+                        help="选择一个常用格式模板，将自动填充到下方文本框"
+                    )
+                    if selected_format:
+                        st.session_state["format_requirements"] = FORMAT_TEMPLATES[selected_format]
+                        st.success(f"已加载 {selected_format} 格式模板")
+                        st.rerun()
+
+        # 即使没有上传文件，也显示格式库选择器
+        if not format_file:
+            st.info("💡 提示：您可以上传格式文件，或从常用格式库中选择：")
+            selected_format = st.selectbox(
+                "选择常用格式",
+                options=[""] + list(FORMAT_TEMPLATES.keys()),
+                key="format_template_selector_no_file",
+                help="选择一个常用格式模板，将自动填充到下方文本框"
+            )
+            if selected_format and selected_format != st.session_state.get("last_selected_format", ""):
+                st.session_state["format_requirements"] = FORMAT_TEMPLATES[selected_format]
+                st.session_state["last_selected_format"] = selected_format
+                st.success(f"已加载 {selected_format} 格式模板")
+                st.rerun()
 
         format_requirements = st.text_area(
             "format_requirements_text",
             placeholder=t("format_text_placeholder"),
-            height=220,
-            value=st.session_state["format_requirements"],
+            height=300,
+            value=st.session_state.get("format_requirements", ""),
             label_visibility="collapsed",
+            key="format_requirements_input",
         )
+        # Streamlit自动更新session_state，但为了确保兼容性，手动同步
+        st.session_state["format_requirements"] = format_requirements
+        
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ===== 右列：内容（Markdown） =====
-    with col_right:
+        # Next button
+        if st.button("Next: Input Content →", type="primary", use_container_width=True, key="next_to_content"):
+            st.session_state["current_step"] = 2
+            st.rerun()
+    
+    else:
+        # Step 2: Content Input
+        if st.button("← Back", key="back_to_format"):
+            st.session_state["current_step"] = 1
+            st.rerun()
+        
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
         st.markdown(
             f"""
@@ -1505,7 +2620,7 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-        # 内容侧：支持上传 Markdown 文件（与左侧格式区风格一致）
+        # 内容侧：支持上传 Markdown 文件
         content_file = st.file_uploader(
             t("content_uploader_label"),
             type=["md", "markdown"],
@@ -1521,60 +2636,179 @@ def main() -> None:
         markdown_content = st.text_area(
             "content_text",
             placeholder=t("content_text_placeholder"),
-            height=260,
-            value=st.session_state["markdown_content"],
+            height=400,
+            value=st.session_state.get("markdown_content", ""),
             label_visibility="collapsed",
+            key="markdown_content_input",
         )
+        # Streamlit自动更新session_state，但为了确保兼容性，手动同步
+        st.session_state["markdown_content"] = markdown_content
+        
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # 如无需要，可不额外增加底部留白
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # 底部居中 CTA：状态提示 + 圆形生成 + 图标下载
-    st.markdown('<div class="app-footer"><div class="app-footer-inner">', unsafe_allow_html=True)
+    # 底部居中操作区：生成 + 下载
+    st.markdown('<div class="app-footer"><div class="app-footer-inner app-footer-buttons">', unsafe_allow_html=True)
 
     has_doc = st.session_state.get("doc_bytes") is not None
-    status_text = ""
-    if not st.session_state.get("markdown_content", "").strip():
-        status_text = "Step 2 · Paste your markdown to enable Generate"
-    elif not has_doc:
-        status_text = "Ready to generate your Word document"
-    else:
-        status_text = "✅ Document ready · click ↓ to download"
+    format_requirements = st.session_state.get("format_requirements", "")
+    markdown_content = st.session_state.get("markdown_content", "")
+    preview_mode = st.session_state.get("doc_preview_mode", False)
 
-    st.markdown(f'<span class="app-footer-status">{status_text}</span>', unsafe_allow_html=True)
-
-    btn_col1, btn_col2 = st.columns([1, 1])
-    with btn_col1:
-        gen_clicked = st.button("➕", type="primary", key="generate_doc")
-
-    with btn_col2:
-        st.download_button(
-            label="⬇",
+    # 如果不在预览模式，显示生成和下载按钮
+    if not preview_mode:
+        col_gen, col_dl = st.columns([1, 1])
+        with col_gen:
+            gen_clicked = st.button("Generate", type="primary", key="generate_doc", use_container_width=True)
+        with col_dl:
+            st.download_button(
+                label="Download",
             data=st.session_state["doc_bytes"] if has_doc else b"",
             file_name="formatted_document.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             disabled=not has_doc,
             key="download_doc",
+                use_container_width=True,
+            )
+    else:
+        # 预览模式下，只显示下载按钮（确认后可用）
+        gen_clicked = False
+        st.download_button(
+            label="Download",
+            data=st.session_state["doc_bytes"] if has_doc else b"",
+            file_name="formatted_document.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            disabled=not has_doc,
+            key="download_doc_preview",
+            use_container_width=True,
         )
 
     st.markdown("</div></div>", unsafe_allow_html=True)
 
     if gen_clicked:
-        # 重置旧的文档
+        # 重置旧的文档和预览状态
         st.session_state["doc_bytes"] = None
+        st.session_state["doc_preview_mode"] = False
+        st.session_state["doc_preview_info"] = None
 
         if not markdown_content.strip():
             st.warning(t("warn_need_content"))
         else:
             with st.spinner(t("spinner_generating")):
-                doc_bytes = _generate_document(format_requirements, markdown_content)
+                doc_bytes, preview_info = _generate_document(format_requirements, markdown_content)
                 if doc_bytes:
                     st.session_state["doc_bytes"] = doc_bytes
-                    st.success(t("success_generated"))
-                    # 重新渲染页面，使下载按钮立即可用
+                    st.session_state["doc_preview_mode"] = True
+                    st.session_state["doc_preview_info"] = preview_info
+                    st.success("✅ Document generated. Please review the preview below.")
                     st.rerun()
                 else:
                     st.error(t("error_generating") + "Failed to generate document.")
+
+    # 预览和确认界面
+    if st.session_state.get("doc_preview_mode") and st.session_state.get("doc_bytes") and st.session_state.get("doc_preview_info"):
+        st.markdown("---")
+        st.markdown("### 📋 Document Preview & Adjustment")
+        
+        preview_info = st.session_state["doc_preview_info"]
+        structure = preview_info.get("structure", {})
+        format_cfg = preview_info.get("format", {})
+        
+        # 显示预览信息
+        with st.expander("📊 Document Structure Preview", expanded=True):
+            st.markdown("**Document Structure:**")
+            st.info(
+                f"Title: {structure.get('title_count', 0)} | "
+                f"Heading1: {structure.get('heading1_count', 0)} | "
+                f"Heading2: {structure.get('heading2_count', 0)} | "
+                f"Body paragraphs: {structure.get('body_count', 0)}"
+            )
+            
+            # 显示标题预览
+            preview_titles = structure.get("preview_titles", [])
+            if preview_titles:
+                st.markdown("**Title Preview:**")
+                for title_info in preview_titles[:5]:  # 只显示前5个
+                    title_type = title_info.get("type", "unknown")
+                    title_text = title_info.get("text", "")
+                    st.text(f"[{title_type}] {title_text}")
+            
+            st.markdown("**Format Configuration:**")
+            format_requirements_text = st.session_state.get("format_requirements", "")
+            if format_requirements_text:
+                st.text_area(
+                    "Current Format Requirements",
+                    value=format_requirements_text,
+                    height=150,
+                    disabled=True,
+                    key="preview_format"
+                )
+        
+        # 格式调整对话区
+        st.markdown("### 💬 Format Adjustment Chat")
+        st.markdown("If the document doesn't meet your requirements, describe what needs to be adjusted:")
+        
+        # 显示对话历史
+        chat_history = st.session_state.get("format_adjustment_history", [])
+        if chat_history:
+            st.markdown("**Chat History:**")
+            for i, msg in enumerate(chat_history[-5:]):  # 只显示最近5条
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    with st.chat_message("user"):
+                        st.write(content)
+                else:
+                    with st.chat_message("assistant"):
+                        st.write(content)
+        
+        # 用户输入调整需求
+        user_input = st.chat_input("Describe what format adjustments you need (e.g., '标题字号太小，改成18pt')")
+        
+        if user_input:
+            # 添加到历史
+            chat_history.append({"role": "user", "content": user_input})
+            st.session_state["format_adjustment_history"] = chat_history
+            
+            # 调用AI调整格式
+            with st.spinner("Adjusting format based on your feedback..."):
+                adjusted_format = _apply_format_adjustment(
+                    st.session_state.get("format_requirements", ""),
+                    user_input,
+                    chat_history
+                )
+                
+                # 更新格式要求
+                st.session_state["format_requirements"] = adjusted_format
+                
+                # AI回复
+                ai_reply = "已根据您的需求调整格式要求。已更新格式配置，请点击'Regenerate'重新生成文档。"
+                chat_history.append({"role": "assistant", "content": ai_reply})
+                st.session_state["format_adjustment_history"] = chat_history
+                
+                st.success("Format adjusted! Click 'Regenerate' to apply changes.")
+                st.rerun()
+        
+        # 操作按钮
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            if st.button("✅ Confirm & Download", type="primary", use_container_width=True, key="confirm_download"):
+                st.session_state["doc_preview_mode"] = False
+                st.success("Document ready for download!")
+                st.rerun()
+        with col2:
+            if st.button("🔄 Regenerate", use_container_width=True, key="regenerate_doc"):
+                # 使用更新后的格式要求重新生成
+                st.session_state["doc_bytes"] = None
+                st.session_state["doc_preview_mode"] = False
+                st.rerun()
+        with col3:
+            if st.button("❌ Cancel", use_container_width=True, key="cancel_preview"):
+                st.session_state["doc_bytes"] = None
+                st.session_state["doc_preview_mode"] = False
+                st.session_state["format_adjustment_history"] = []
+                st.rerun()
 
 
 if __name__ == "__main__":
