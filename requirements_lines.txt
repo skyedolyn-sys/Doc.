@@ -1,0 +1,12 @@
+streamlit
+pdfplumber
+pytesseract
+beautifulsoup4
+python-dotenv
+pdf2image
+pillow
+zhipuai
+python-docx
+lxml
+html5lib
+requests
