@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""
+Local performance test for llm_segment_blocks batching behavior.
+"""
+import sys
+import time
+import json
+import re
+import types
+from typing import List
+
+
+def make_dummy_streamlit_module():
+    m = types.ModuleType("streamlit")
+
+    class DummyProgress:
+        def progress(self, v):
+            return None
+        def empty(self):
+            return None
+
+    class DummyEmpty:
+        def text(self, s):
+            return None
+        def empty(self):
+            return None
+
+    def progress(x=0):
+        return DummyProgress()
+
+    def empty():
+        return DummyEmpty()
+
+    def write(*a, **k):
+        return None
+
+    def warning(*a, **k):
+        return None
+
+    def info(*a, **k):
+        return None
+
+    m.progress = progress
+    m.empty = empty
+    m.write = write
+    m.warning = warning
+    m.info = info
+    m.set_page_config = lambda **k: None
+    return m
+
+
+def make_dummy_module(name: str):
+    return types.ModuleType(name)
+
+
+def install_dummy_modules():
+    names = [
+        "pdfplumber",
+        "pytesseract",
+        "bs4",
+        "dotenv",
+        "pdf2image",
+        "PIL",
+        "zhipuai",
+        "docx",
+    ]
+    sys.modules["streamlit"] = make_dummy_streamlit_module()
+    for n in names:
+        if n in sys.modules:
+            continue
+        if n == "zhipuai":
+            m = types.ModuleType("zhipuai")
+            class ZhipuAI:
+                def __init__(self, api_key=None):
+                    pass
+            m.ZhipuAI = ZhipuAI
+            sys.modules[n] = m
+        else:
+            # provide minimal implementations for commonly used symbols
+            if n == "bs4":
+                m = types.ModuleType("bs4")
+                class BeautifulSoup:
+                    def __init__(self, html, parser):
+                        self._html = html
+                    def get_text(self, sep="\n"):
+                        return str(self._html)
+                m.BeautifulSoup = BeautifulSoup
+                sys.modules[n] = m
+            elif n == "PIL":
+                m = types.ModuleType("PIL")
+                img = types.ModuleType("PIL.Image")
+                class Image:
+                    pass
+                img.Image = Image
+                m.Image = img
+                sys.modules[n] = m
+            elif n == "pdf2image":
+                m = types.ModuleType("pdf2image")
+                def convert_from_bytes(raw, dpi=200):
+                    return []
+                m.convert_from_bytes = convert_from_bytes
+                sys.modules[n] = m
+            elif n == "docx":
+                # minimal docx stub used by doc_generator.py
+                m = types.ModuleType("docx")
+                class Document:
+                    def __init__(self, *a, **k):
+                        pass
+                    def add_paragraph(self, *a, **k):
+                        class P:
+                            def __init__(self):
+                                self.runs = []
+                                self.paragraph_format = types.SimpleNamespace()
+                            def add_run(self, text=""):
+                                class R:
+                                    def __init__(self, t=""):
+                                        self.text = t
+                                        self.font = types.SimpleNamespace()
+                                        self._element = types.SimpleNamespace()
+                                r = R(text)
+                                self.runs.append(r)
+                                return r
+                        return P()
+                    def save(self, buf):
+                        return None
+                m.Document = Document
+
+                # enums
+                enum = types.ModuleType("docx.enum")
+                enum_section = types.ModuleType("docx.enum.section")
+                class WD_ORIENT:
+                    PORTRAIT = 1
+                enum_section.WD_ORIENT = WD_ORIENT
+                sys.modules["docx.enum.section"] = enum_section
+
+                enum_text = types.ModuleType("docx.enum.text")
+                class WD_ALIGN_PARAGRAPH:
+                    CENTER = 1
+                    LEFT = 2
+                    RIGHT = 3
+                    JUSTIFY = 4
+                enum_text.WD_ALIGN_PARAGRAPH = WD_ALIGN_PARAGRAPH
+                sys.modules["docx.enum.text"] = enum_text
+
+                # shared
+                shared = types.ModuleType("docx.shared")
+                def Cm(v):
+                    return v
+                def Pt(v):
+                    return v
+                shared.Cm = Cm
+                shared.Pt = Pt
+                sys.modules["docx.shared"] = shared
+
+                # oxml.ns
+                oxml = types.ModuleType("docx.oxml")
+                oxml_ns = types.ModuleType("docx.oxml.ns")
+                def qn(val):
+                    return val
+                oxml_ns.qn = qn
+                sys.modules["docx.oxml.ns"] = oxml_ns
+
+                sys.modules[n] = m
+            elif n == "dotenv":
+                m = types.ModuleType("dotenv")
+                def load_dotenv():
+                    return None
+                m.load_dotenv = load_dotenv
+                sys.modules[n] = m
+            else:
+                sys.modules[n] = make_dummy_module(n)
+
+
+def synthetic_text(target_chars: int) -> str:
+    para = "This is a synthetic test paragraph for performance measurement. "
+    para *= 6
+    para = para.strip()
+    out = []
+    while len("".join(out)) < target_chars:
+        out.append(para + "\n\n")
+    return "".join(out)[:target_chars]
+
+
+def make_batch_stub(call_counter: dict):
+    chunk_re = re.compile(r"===CHUNK\s+(\d+)===\n", re.M)
+
+    def stub(prompt: str, **kwargs):
+        call_counter["calls"] += 1
+        parts = re.split(r"===CHUNK\s+(\d+)===", prompt)
+        results: List[dict] = []
+        for i in range(1, len(parts), 2):
+            idx = parts[i]
+            text = parts[i + 1]
+            try:
+                cidx = int(idx)
+            except Exception:
+                continue
+            snippet = text.strip().replace("\n", " ")[:120]
+            results.append(
+                {"chunk_index": cidx, "blocks": [{"type": "body", "text": f"Processed chunk {cidx}: {snippet}"}]}
+            )
+        return json.dumps(results, ensure_ascii=False)
+
+    return stub
+
+
+def run_test():
+    install_dummy_modules()
+    import importlib.util
+    import os
+    app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
+    spec = importlib.util.spec_from_file_location("app", app_path)
+    app = importlib.util.module_from_spec(spec)
+    sys.modules["app"] = app
+    # ensure project root is on sys.path so relative imports in app.py work
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    spec.loader.exec_module(app)
+
+    sizes = [10000, 50000, 100000]
+    results = []
+    for n in sizes:
+        text = synthetic_text(n)
+        call_counter = {"calls": 0}
+        app._call_zhipu_llm = make_batch_stub(call_counter)
+
+        t0 = time.perf_counter()
+        blocks = app.llm_segment_blocks("", text)
+        elapsed = time.perf_counter() - t0
+
+        total_blocks = len(blocks)
+        results.append({"size": n, "time_s": elapsed, "llm_calls": call_counter["calls"], "blocks": total_blocks})
+        print(f"size={n:,} chars -> time={elapsed:.2f}s calls={call_counter['calls']} blocks={total_blocks}")
+
+    print("\nSummary:")
+    print(json.dumps(results, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    run_test()
+
+

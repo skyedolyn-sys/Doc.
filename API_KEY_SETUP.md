@@ -18,12 +18,12 @@
    ```bash
    # 使用文本编辑器打开 .env 文件
    # 添加以下内容（替换为你的实际 API key）：
-   ZHIPU_API_KEY=ff692275b8544af796bb9991b71ef0b0.IpJzQIwWJ7taKFx5
+   ZHIPU_API_KEY=71fe529b67ec4a82a08ff70052b710e6.3FwsCmF5KHOH1wJa
    ```
 
    或者使用命令行：
    ```bash
-   echo "ZHIPU_API_KEY=ff692275b8544af796bb9991b71ef0b0.IpJzQIwWJ7taKFx5" > .env
+   echo "71fe529b67ec4a82a08ff70052b710e6.3FwsCmF5KHOH1wJa" > .env
    ```
 
 3. **验证设置**：

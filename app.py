@@ -11,9 +11,9 @@ import pytesseract
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageOps
 from zhipuai import ZhipuAI
-
+from typing import Optional, List
 from format_parser import get_default_config, parse_markdown
 from doc_generator import generate_docx, doc_to_bytes
 
@@ -123,8 +123,8 @@ def _call_zhipu_llm(
     prompt: str,
     model: str = "glm-4-flash",
     temperature: float = 0.1,
-    image_url: str | None = None,
-    image_urls: list[str] | None = None,
+    image_url: Optional[str] = None,
+    image_urls: Optional[List[str]] = None,
     timeout: int = 30,
     max_retries: int = 2,
 ) -> str:
@@ -349,6 +349,28 @@ def zhipu_ocr_from_pdf(raw: bytes, max_pages: int | None = None) -> str:
 
 def extract_format_from_image(raw: bytes) -> str:
     """使用智谱多模态模型从格式要求截图中提取文字（侧重排版/格式描述）。"""
+    def _local_ocr_from_bytes(raw_bytes: bytes) -> str:
+        """Use local pytesseract (with simple preprocessing) to extract text from image bytes."""
+        try:
+            img = Image.open(BytesIO(raw_bytes)).convert("L")  # convert to grayscale
+            img = ImageOps.autocontrast(img)
+            # upscale to improve OCR on low-res images
+            img = img.resize((int(img.width * 2), int(img.height * 2)), Image.BILINEAR)
+            text = pytesseract.image_to_string(img, lang="chi_sim+eng", config="--psm 3")
+            return text.strip()
+        except Exception:
+            return ""
+
+    # 1) Prefer remote multimodal OCR if client exists; otherwise, fallback to local OCR
+    client = _get_zhipu_client()
+    if not client:
+        try:
+            st.warning("ZHIPU_API_KEY not set — using local Tesseract OCR fallback.")
+        except Exception:
+            pass
+        return _local_ocr_from_bytes(raw)
+
+    # 2) Prepare image for remote multimodal call
     try:
         img = Image.open(BytesIO(raw))
         buf = BytesIO()
@@ -371,10 +393,6 @@ def extract_format_from_image(raw: bytes) -> str:
             "- 段落格式（如首行缩进2字符、段前段后间距）\n"
             "- 引用/脚注/参考文献格式要求\n"
             "- 页眉页脚、页码格式等\n\n"
-            "**重要：格式要求的语言区分**：\n"
-            "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），必须保留这些语言区分标记\n"
-            "- 如果格式要求没有明确指定语言，根据格式描述的语种判断：中文描述=中文格式要求，英文描述=英文格式要求\n"
-            "- 如果同时包含中英文格式要求，保持原文的排列顺序，或先中文后英文\n\n"
             "**严格排除以下非格式内容**：\n"
             "- 课程名称、课程介绍、课程目标\n"
             "- 作业题目、写作主题、内容要求\n"
@@ -388,15 +406,34 @@ def extract_format_from_image(raw: bytes) -> str:
             "- 优先识别和提取，确保准确性和速度"
         )
 
-        return _call_zhipu_llm(
+        content = _call_zhipu_llm(
             prompt=prompt,
             model="glm-4v",
             temperature=0.1,
             image_url=data_url,
             timeout=60,  # 多模态模型需要更长时间
         )
+
+        # Debug: show short preview of remote output
+        try:
+            st.write("DEBUG: multimodal returned (short):", repr(content)[:1000])
+        except Exception:
+            pass
+
+        # If remote returned nothing, fallback to local OCR
+        if not content or not content.strip():
+            fallback = _local_ocr_from_bytes(raw)
+            try:
+                st.info("Remote OCR returned empty — used local Tesseract fallback.")
+                st.write("🔍 local OCR (first 2000 chars):", repr(fallback)[:2000])
+            except Exception:
+                pass
+            return fallback
+
+        return content
     except Exception:
-        return ""
+        # final safety: attempt local OCR before giving up
+        return _local_ocr_from_bytes(raw)
 
 
 def _clean_format_output(content: str) -> str:
@@ -469,6 +506,37 @@ def _clean_format_output(content: str) -> str:
             cleaned_lines.append(line)
     
     return '\n'.join(cleaned_lines).strip()
+
+
+def normalize_ocr_text(text: str) -> str:
+    """简单修正常见的 OCR/模型识别错误并做少量规范化，返回清洗后的文本。"""
+    if not text:
+        return text
+    s = text
+
+    # 常见错字映射（可按需添加）
+    replacements = {
+        r"\\bdbuble\\b": "double",
+        r"\\bdbuble-?\\s*spac(?:ed|e)?\\b": "double-spaced",
+        r"\\bouble-?spaced\\b": "double-spaced",
+        r"\\bDuble-?spaced\\b": "double-spaced",
+        r"\\bPage\\s*:\\s*": "Page: ",
+        r"\\bLength\\s*:\\s*": "Length: ",
+        r"\\b1\\.27cm\\b": "1.27cm",
+        # 英文常见连字符/空格问题
+        r"(\\b[0-9]+)\\s+pt\\b": r"\\1pt",
+    }
+    for pat, rep in replacements.items():
+        try:
+            s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+        except Exception:
+            pass
+
+    # 修正常见 OCR 引起的重复空格/非ascii可见字符
+    s = re.sub(r"[ \\t]{2,}", " ", s)
+    s = re.sub(r"\\uFFFD", "", s)  # 删除替换字符
+    s = s.strip()
+    return s
 
 
 def extract_format_from_pdf(raw: bytes, max_pages: int = 5) -> str:
@@ -746,10 +814,6 @@ def llm_extract_format_only(text: str) -> str:
         "- 段落格式（如首行缩进2字符、段前段后间距）\n"
         "- 引用/脚注/参考文献格式要求\n"
         "- 页眉页脚、页码格式等\n\n"
-        "**重要：格式要求的语言区分**：\n"
-        "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），必须保留这些语言区分标记\n"
-        "- 如果格式要求没有明确指定语言，根据格式描述的语种判断：中文描述=中文格式要求，英文描述=英文格式要求\n"
-        "- 如果同时包含中英文格式要求，保持原文的排列顺序，或先中文后英文\n\n"
         "**严格排除以下非格式内容**：\n"
         "- 课程名称、课程介绍、课程目标、课程大纲\n"
         "- 作业题目、写作主题、内容要求、写作指导\n"
@@ -1074,103 +1138,6 @@ def llm_segment_blocks(format_requirements: str, body: str) -> list[dict]:
             blocks.append({"type": block_type, "text": text})
 
     return blocks
-
-
-# ======================
-# 文档语言检测与格式要求分类
-# ======================
-
-def detect_document_language(content: str) -> str:
-    """检测文档内容的主要语言（中文/英文）。
-    
-    Args:
-        content: 文档内容文本
-    
-    Returns:
-        "chinese" 或 "english"
-    """
-    if not content or not content.strip():
-        return "english"  # 默认英文
-    
-    # 统计中文字符数量
-    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', content))
-    # 统计英文字符数量（字母）
-    english_chars = len(re.findall(r'[a-zA-Z]', content))
-    
-    # 如果中文字符占比超过30%，认为是中文文档
-    total_chars = chinese_chars + english_chars
-    if total_chars == 0:
-        return "english"  # 默认英文
-    
-    chinese_ratio = chinese_chars / total_chars
-    return "chinese" if chinese_ratio > 0.3 else "english"
-
-
-def classify_format_requirements(format_text: str) -> dict[str, str]:
-    """将格式要求文本分类为中文格式要求和英文格式要求。
-    
-    Args:
-        format_text: 格式要求文本（可能包含中英文混合）
-    
-    Returns:
-        包含 "chinese" 和 "english" 键的字典，值为对应的格式要求文本
-    """
-    if not format_text or not format_text.strip():
-        return {"chinese": "", "english": ""}
-    
-    prompt = (
-        "下面是一段格式要求文本，可能同时包含中文格式要求和英文格式要求。"
-        "请将其分类为两部分：中文格式要求和英文格式要求。\n\n"
-        "**分类标准**：\n"
-        "- **中文格式要求**：包含中文描述或中文格式术语，如\"1.5倍行距\"、\"宋体小四\"、\"黑体三号\"、\"首行缩进2字符\"、\"段前段后间距\"、\"左对齐\"、\"居中\"等\n"
-        "- **英文格式要求**：包含英文描述或英文格式术语，如\"double spacing\"、\"Times New Roman\"、\"1-inch margins\"、\"APA 7th edition\"、\"centered\"、\"bold\"、\"left-aligned\"、\"first-line indent\"等\n"
-        "- 如果格式要求明确指定了适用的语言（如\"中文部分：...\"、\"English text: ...\"、\"For Chinese: ...\"、\"For English: ...\"），按照标记分类\n"
-        "- 如果格式要求没有明确指定语言，根据格式描述的语种判断\n"
-        "- 通用格式要素（如\"A4\"、\"12pt\"、\"2.5cm\"等）如果出现在中文描述中，归入中文格式要求；如果出现在英文描述中，归入英文格式要求\n\n"
-        "**输出格式**（JSON对象）：\n"
-        "{\n"
-        '  "chinese": "中文格式要求文本（如果没有则返回空字符串）",\n'
-        '  "english": "英文格式要求文本（如果没有则返回空字符串）"\n'
-        "}\n\n"
-        "**输出要求**：\n"
-        "- 只输出JSON，不要添加解释\n"
-        "- 如果只有一种语言的格式要求，另一种语言的值为空字符串\n"
-        "- 保持原文表述，不要翻译\n\n"
-        f"格式要求文本：\n{format_text[:4000]}"
-    )
-    
-    content = _call_zhipu_llm(prompt=prompt, model="glm-4-flash", temperature=0.1, timeout=30)
-    if not content:
-        # 如果LLM调用失败，尝试简单的关键词检测
-        format_lower = format_text.lower()
-        chinese_keywords = ["宋体", "黑体", "gb/t", "国标", "中文", "小四", "四号", "三号", "倍行距", "字符"]
-        english_keywords = ["times new roman", "arial", "calibri", "double spacing", "single spacing", 
-                           "apa", "mla", "chicago", "inch", "first-line indent"]
-        
-        has_chinese = any(kw in format_lower for kw in chinese_keywords)
-        has_english = any(kw in format_lower for kw in english_keywords)
-        
-        if has_chinese and has_english:
-            # 如果同时包含中英文关键词，返回原文本（让后续逻辑处理）
-            return {"chinese": format_text, "english": format_text}
-        elif has_chinese:
-            return {"chinese": format_text, "english": ""}
-        elif has_english:
-            return {"chinese": "", "english": format_text}
-        else:
-            # 无法判断，默认全部归为中文
-            return {"chinese": format_text, "english": ""}
-    
-    # 提取JSON
-    data = _extract_json_from_text(content, bracket_type="{")
-    if not isinstance(data, dict):
-        # 解析失败，默认全部归为中文
-        return {"chinese": format_text, "english": ""}
-    
-    chinese_format = str(data.get("chinese", "")).strip()
-    english_format = str(data.get("english", "")).strip()
-    
-    return {"chinese": chinese_format, "english": english_format}
 
 
 # ======================
@@ -1747,56 +1714,51 @@ def _generate_document(format_requirements: str, markdown_content: str) -> tuple
         # 获取默认配置
         default_config = get_default_config()
         
-        # 关键修复：检测文档语言并选择对应的格式要求
-        doc_language = detect_document_language(markdown_content)
-        
-        # 分类格式要求
-        classified_formats = {"chinese": "", "english": ""}
-        if format_requirements and format_requirements.strip():
-            classified_formats = classify_format_requirements(format_requirements)
-        
-        # 根据文档语言选择格式要求
-        selected_format = ""
-        if doc_language == "chinese":
-            # 中文文档：优先使用中文格式要求，如果没有则使用英文格式要求
-            selected_format = classified_formats["chinese"] or classified_formats["english"]
-        else:
-            # 英文文档：优先使用英文格式要求
-            if classified_formats["english"]:
-                selected_format = classified_formats["english"]
-            elif classified_formats["chinese"]:
-                # 如果只有中文格式要求，使用默认格式（最通用的格式）
-                st.info("⚠️ 检测到英文文档，但格式要求只有中文。将使用默认英文格式（Times New Roman 12pt, 0.5英寸首行缩进）。")
-                selected_format = ""  # 使用默认配置
-            else:
-                selected_format = ""
-        
         # 如果格式要求文本存在，解析并合并配置
-        if selected_format and selected_format.strip():
-            parsed_config = parse_format_requirements(selected_format)
+        if format_requirements and format_requirements.strip():
+            parsed_config = parse_format_requirements(format_requirements)
             if parsed_config:
-                config = _merge_config(default_config, parsed_config, selected_format)
+                config = _merge_config(default_config, parsed_config, format_requirements)
                 # 调试：显示最终配置的首行缩进值
                 body_indent = config.get("body", {}).get("first_line_chars", "未设置")
                 body_font = config.get("body", {}).get("font_cn", "未设置")
-                st.write(f"🔧 调试信息 - 文档语言: {doc_language}, 首行缩进: {body_indent}, 字体: {body_font}")
+                st.write(f"🔧 调试信息 - 首行缩进: {body_indent}, 字体: {body_font}")
             else:
                 config = default_config
         else:
-            # 使用默认配置，但对于英文文档，确保使用正确的默认格式
-            if doc_language == "english":
-                # 设置默认英文格式
-                config = default_config.copy()
-                body_cfg = config.get("body", {}).copy()
-                body_cfg["font_cn"] = "Times New Roman"  # 英文字体
-                body_cfg["font_en"] = "Times New Roman"
-                body_cfg["size_pt"] = 12
-                body_cfg["first_line_chars"] = 4.5  # 0.5英寸
-                config["body"] = body_cfg
-                st.write(f"🔧 调试信息 - 文档语言: {doc_language}, 使用默认英文格式")
-            else:
-                config = default_config
+            config = default_config
         
+        # 如果用户通过 UI 确认了自动解析的配置，则优先合并该确认配置
+        confirmed_cfg = st.session_state.get("format_confirmed_config")
+        if isinstance(confirmed_cfg, dict):
+            try:
+                # 确保 config 已存在
+                if "page" not in config:
+                    config["page"] = {}
+                if "title" not in config:
+                    config["title"] = {}
+                if "heading1" not in config:
+                    config["heading1"] = {}
+                if "heading2" not in config:
+                    config["heading2"] = {}
+                if "body" not in config:
+                    config["body"] = {}
+
+                # Merge page-level settings
+                for k, v in confirmed_cfg.get("page", {}).items():
+                    config["page"][k] = v
+
+                # Merge title/body specific settings
+                for section in ("title", "heading1", "heading2", "body"):
+                    sec_vals = confirmed_cfg.get(section, {})
+                    if isinstance(sec_vals, dict):
+                        for k, v in sec_vals.items():
+                            config.setdefault(section, {})[k] = v
+                st.write("✅ Using user-confirmed format configuration for generation.")
+            except Exception:
+                # 不要中断主流程，继续使用现有 config
+                pass
+
         # 生成预览信息
         preview_info = _generate_preview_info(blocks, config)
         
@@ -2545,17 +2507,100 @@ def main() -> None:
             # 如果是图片文件，显示预览
             if suffix in {".png", ".jpg", ".jpeg"}:
                 image_bytes = format_file.getvalue()
-                st.image(image_bytes, caption=t("image_preview_caption"), use_column_width=True)
+                # use `width` (pixels) instead of deprecated use_column_width
+                st.image(image_bytes, caption=t("image_preview_caption"), width=700)
             
             if is_new_file:
                 # 仅在新文件时调用 AI 识别，避免重复耗时操作
                 with st.spinner(t("spinner_recognizing_image")):
                     recognized = extract_format_requirements_unified(format_file)
                 
+                # 临时调试输出：显示 AI 原始识别结果（便于排查为空或被清洗）
+                try:
+                    st.write("🔍 raw AI output (first 2000 chars):", repr(recognized)[:2000])
+                except Exception:
+                    # 在某些环境中 st.write 对象可能会抛错，忽略以防影响主流程
+                    pass
+                
                 st.session_state["last_format_file_id"] = file_id
                 if recognized:
-                    st.session_state["format_requirements"] = recognized
+                    # 先做简单清洗再存储到 session
+                    cleaned_text = normalize_ocr_text(recognized)
+                    st.session_state["format_requirements"] = cleaned_text
+                    # 同步到格式文本框的内部 key 并触发重渲染，确保控件立即显示识别结果
+                    try:
+                        st.session_state["format_requirements_input"] = cleaned_text
+                        st.experimental_rerun()
+                    except Exception:
+                        pass
                     st.success(t("success_format_recognized"))
+
+                    # 如果是图片文件，先清洗文本再解析为结构化配置，并展示为可编辑表单供用户确认
+                    if suffix in {".png", ".jpg", ".jpeg"}:
+                        try:
+                            parsed_cfg = parse_format_requirements(cleaned_text)
+                            if parsed_cfg:
+                                st.session_state["parsed_format_config"] = parsed_cfg
+
+                                # 在 UI 中展示可编辑的解析结果，用户确认后应用到 format_confirmed_config
+                                with st.expander("📄 Parsed format (review & edit)", expanded=True):
+                                    st.write("Below are the fields auto-extracted from the image. Edit if needed, then click Apply.")
+                                    page_cfg = parsed_cfg.get("page", {})
+                                    title_cfg = parsed_cfg.get("title", {})
+                                    body_cfg = parsed_cfg.get("body", {})
+
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        page_size = st.text_input("Paper size", value=str(page_cfg.get("paper_size", "A4")))
+                                        margin_top = st.text_input("Top margin (cm)", value=str(page_cfg.get("margin_top_cm", "")))
+                                        margin_bottom = st.text_input("Bottom margin (cm)", value=str(page_cfg.get("margin_bottom_cm", "")))
+                                    with col2:
+                                        margin_left = st.text_input("Left margin (cm)", value=str(page_cfg.get("margin_left_cm", "")))
+                                        margin_right = st.text_input("Right margin (cm)", value=str(page_cfg.get("margin_right_cm", "")))
+                                        body_font = st.text_input("Body font (cn)", value=str(body_cfg.get("font_cn", "")))
+
+                                    title_size = st.text_input("Title size (pt)", value=str(title_cfg.get("size_pt", "")))
+                                    body_size = st.text_input("Body size (pt)", value=str(body_cfg.get("size_pt", "")))
+                                    body_first_line = st.text_input("Body first_line_chars", value=str(body_cfg.get("first_line_chars", "")))
+
+                                    if st.button("Apply parsed config", key=f"apply_parsed_{file_id}"):
+                                        confirmed = {"page": {}, "title": {}, "body": {}}
+                                        if page_size:
+                                            confirmed["page"]["paper_size"] = page_size
+                                        try:
+                                            if margin_top:
+                                                confirmed["page"]["margin_top_cm"] = float(margin_top)
+                                            if margin_bottom:
+                                                confirmed["page"]["margin_bottom_cm"] = float(margin_bottom)
+                                            if margin_left:
+                                                confirmed["page"]["margin_left_cm"] = float(margin_left)
+                                            if margin_right:
+                                                confirmed["page"]["margin_right_cm"] = float(margin_right)
+                                        except Exception:
+                                            st.warning("One of the margin values couldn't be parsed; please use numbers (cm).")
+
+                                        if title_size:
+                                            try:
+                                                confirmed["title"]["size_pt"] = float(title_size)
+                                            except Exception:
+                                                pass
+                                        if body_font:
+                                            confirmed["body"]["font_cn"] = body_font
+                                        if body_size:
+                                            try:
+                                                confirmed["body"]["size_pt"] = float(body_size)
+                                            except Exception:
+                                                pass
+                                        if body_first_line:
+                                            try:
+                                                confirmed["body"]["first_line_chars"] = float(body_first_line)
+                                            except Exception:
+                                                pass
+
+                                        st.session_state["format_confirmed_config"] = confirmed
+                                        st.success("Parsed configuration applied — will be used for generation.")
+                        except Exception:
+                            st.warning("Automatic parsing of extracted image text failed.")
                 else:
                     st.warning(t("warn_image_not_recognized"))
                     # 识别失败时，显示常用格式库选择器
@@ -2630,8 +2675,47 @@ def main() -> None:
         )
         if content_file is not None:
             _, md_text = parse_uploaded_file(content_file)
+            # Debug: show whether parsing returned content
+            try:
+                st.write("DEBUG: uploaded md parsed length:", len(md_text or ""))
+            except Exception:
+                pass
+
             if md_text:
                 st.session_state["markdown_content"] = md_text
+                # Ensure the text_area widget (key=markdown_content_input) shows the uploaded content
+                try:
+                    st.session_state["markdown_content_input"] = md_text
+                    # Force rerun so the widget reflects the new value immediately
+                    st.experimental_rerun()
+                except Exception:
+                    pass
+            else:
+                # Fallback: some Streamlit UploadedFile objects work better with getvalue()
+                try:
+                    raw = content_file.getvalue()
+                    if isinstance(raw, (bytes, bytearray)):
+                        alt = None
+                        for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+                            try:
+                                alt = raw.decode(enc)
+                                if alt and alt.strip():
+                                    break
+                            except Exception:
+                                continue
+                        if alt and alt.strip():
+                            st.session_state["markdown_content"] = alt
+                            try:
+                                st.session_state["markdown_content_input"] = alt
+                                st.experimental_rerun()
+                            except Exception:
+                                pass
+                            try:
+                                st.info("Uploaded markdown decoded using fallback encoding.")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
         markdown_content = st.text_area(
             "content_text",
