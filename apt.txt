@@ -1,5 +1,9 @@
 tesseract-ocr
 poppler-utils
+# additional packages if needed by system
+libtiff5
+libjpeg-dev
+
 
 
 

@@ -11,3 +11,17 @@ lxml
 html5lib
 requests
 sniffio
+# pinned versions for reproducible deploys
+streamlit==1.52.2
+zhipuai==2.1.5.20250825
+python-dotenv==1.2.1
+pdfplumber==0.7.8
+pytesseract==0.3.10
+pdf2image==1.17.0
+pillow==12.0.0
+beautifulsoup4==4.12.2
+python-docx==0.8.11
+lxml==4.9.3
+html5lib==1.1
+requests==2.32.2
+sniffio==1.3.1

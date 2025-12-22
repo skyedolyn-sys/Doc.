@@ -1817,6 +1817,11 @@ def main() -> None:
     # 初始化语言（默认英文）
     if "lang" not in st.session_state:
         st.session_state["lang"] = "en"
+    # 显示 key 存在性（仅调试用）
+    try:
+        debug_key_presence()
+    except Exception:
+        pass
 
     # 页面基础配置
     st.set_page_config(
@@ -2913,6 +2918,26 @@ def main() -> None:
                 
                 st.success("Format adjusted! Click 'Regenerate' to apply changes.")
                 st.rerun()
+        
+        # --- AI 健康检查（临时调试区块） ---
+        with st.expander("AI Health Check (debug)"):
+            st.markdown("Use this to test whether the app can reach the AI backend. This is for debugging only.")
+            if st.button("Run AI connectivity test"):
+                client = _get_zhipu_client()
+                if not client:
+                    st.error("No API key available. Set ZHIPU_API_KEY in Streamlit Secrets.")
+                else:
+                    with st.spinner("Calling AI..."):
+                        try:
+                            test_prompt = "Please reply with the single word: PONG"
+                            resp = _call_zhipu_llm(prompt=test_prompt, model="glm-4-flash", timeout=15, max_retries=2)
+                            if resp and resp.strip():
+                                st.success("AI responded")
+                                st.write(resp[:1000])
+                            else:
+                                st.error("AI did not return a response. Check logs.")
+                        except Exception as e:
+                            st.error(f"AI call exception: {str(e)[:200]}")
         
         # 操作按钮
         col1, col2, col3 = st.columns([1, 1, 1])
