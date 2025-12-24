@@ -1657,15 +1657,19 @@ def _generate_document(format_requirements: str, markdown_content: str) -> tuple
             start_time = time.time()
             
             parsed_blocks = parse_markdown(markdown_content)
-            # 转换为统一格式
-            blocks = [
-                {
-                    "type": block.get("type", "body"),
-                    "text": block.get("text", "").strip()
-                }
-                for block in parsed_blocks
-                if block.get("text", "").strip()
-            ]
+            # 转换为统一格式，保留 table 块（包含 table 字段）
+            blocks = []
+            for block in parsed_blocks:
+                btype = block.get("type", "body")
+                if btype == "table":
+                    # 保留表格数据
+                    table_data = block.get("table") or []
+                    if table_data:
+                        blocks.append({"type": "table", "text": "", "table": table_data})
+                else:
+                    text = str(block.get("text", "")).strip()
+                    if text:
+                        blocks.append({"type": btype, "text": text})
             
             elapsed_time = time.time() - start_time
             if elapsed_time > 0.1:
@@ -1686,14 +1690,17 @@ def _generate_document(format_requirements: str, markdown_content: str) -> tuple
             # 如果LLM识别失败，回退到parse_markdown（可能文本中有未检测到的格式）
             if not blocks:
                 parsed_blocks = parse_markdown(markdown_content)
-                blocks = [
-                    {
-                        "type": block.get("type", "body"),
-                        "text": block.get("text", "").strip()
-                    }
-                    for block in parsed_blocks
-                    if block.get("text", "").strip()
-                ]
+                blocks = []
+                for block in parsed_blocks:
+                    btype = block.get("type", "body")
+                    if btype == "table":
+                        table_data = block.get("table") or []
+                        if table_data:
+                            blocks.append({"type": "table", "text": "", "table": table_data})
+                    else:
+                        text = str(block.get("text", "")).strip()
+                        if text:
+                            blocks.append({"type": btype, "text": text})
         
         # 调试输出：显示识别结果统计
         if blocks:
@@ -1710,6 +1717,12 @@ def _generate_document(format_requirements: str, markdown_content: str) -> tuple
                 if not isinstance(item, dict):
                     continue
                 block_type = str(item.get("type", "body"))
+                # 对 table 类型特殊处理，保留 table 数据
+                if block_type == "table":
+                    table_data = item.get("table") or []
+                    if table_data:
+                        normalized.append({"type": "table", "text": "", "table": table_data})
+                    continue
                 text = str(item.get("text", "")).strip()
                 if not text:
                     continue
