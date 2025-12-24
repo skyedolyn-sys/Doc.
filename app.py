@@ -116,47 +116,24 @@ def t(key: str) -> str:
 # ======================
 
 def _get_zhipu_client():
-    """获取 ZhipuAI 客户端。优先从 Streamlit Secrets 读取，再回退到环境变量。"""
-    api_key = None
-    # 优先尝试从 Streamlit Secrets 读取（在 Streamlit Cloud 中设置）
+    """获取 ZhipuAI 客户端（本地 demo 专用）。
+    直接从环境变量读取 ZHIPU_API_KEY（或 .env），不依赖 Streamlit Secrets。
+    """
     try:
-        if hasattr(st, "secrets") and st.secrets.get("ZHIPU_API_KEY"):
-            api_key = st.secrets.get("ZHIPU_API_KEY")
+        # 尝试加载本地 .env（容错）
+        load_dotenv()
     except Exception:
-        # 忽略 secrets 读取错误（不要暴露异常）
         pass
 
-    # 回退到环境变量（本地开发或 CI）
+    api_key = os.getenv("ZHIPU_API_KEY")
     if not api_key:
-        api_key = os.getenv("ZHIPU_API_KEY")
-
-    if not api_key:
-        # 仅显示存在性提示，不要输出密钥本身
         try:
-            st.warning("ZHIPU API key not found. Please set ZHIPU_API_KEY in Streamlit Secrets.")
+            st.error("ZHIPU_API_KEY 未设置，请在本地 .env 中添加 ZHIPU_API_KEY 或导出环境变量。")
         except Exception:
             pass
         return None
 
     return ZhipuAI(api_key=api_key)
-
-
-def debug_key_presence():
-    """临时调试函数：显示 key 是否存在于 env 或 st.secrets（不显示 key 值）。"""
-    try:
-        env_present = bool(os.getenv("ZHIPU_API_KEY"))
-        secret_present = False
-        try:
-            secret_present = bool(st.secrets.get("ZHIPU_API_KEY"))
-        except Exception:
-            secret_present = False
-        try:
-            st.text(f"ZHIPU_API_KEY in env: {env_present}, in st.secrets: {secret_present}")
-        except Exception:
-            # 在某些导入阶段可能没有 UI，上面不应抛出
-            pass
-    except Exception:
-        pass
 
 
 def _call_zhipu_llm(
